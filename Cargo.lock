@@ -963,6 +963,7 @@ dependencies = [
  "esp-idf-svc",
  "log",
  "mipidsi",
+ "toml-cfg",
 ]
 
 [[package]]
@@ -1486,6 +1487,20 @@ dependencies = [
  "serde_spanned",
  "toml_datetime 0.6.11",
  "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "toml-cfg"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68c587298ddd135c156e92e8c3eae69614d6eecea8e2d8a09daab011e5e6a21d"
+dependencies = [
+ "heck 0.4.1",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.118",
+ "toml",
 ]
 
 [[package]]

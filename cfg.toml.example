@@ -1,0 +1,6 @@
+# このファイルを cfg.toml という名前でコピーして、自宅のWi-Fi情報を記入する。
+# cfg.toml は .gitignore 済みなのでリポジトリにはコミットされない。
+#   cp cfg.toml.example cfg.toml
+[kitchen-companion]
+wifi_ssid = ""
+wifi_pass = ""

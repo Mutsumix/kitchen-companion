@@ -1,7 +1,9 @@
 use embedded_graphics::{
+    mono_font::{ascii::FONT_10X20, MonoTextStyle},
     pixelcolor::Rgb565,
     prelude::*,
     primitives::{Circle, PrimitiveStyle, Rectangle},
+    text::Text,
 };
 use esp_idf_hal::{
     delay::{Delay, FreeRtos, BLOCK},
@@ -11,12 +13,27 @@ use esp_idf_hal::{
     spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig},
     units::FromValueType,
 };
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop,
+    nvs::EspDefaultNvsPartition,
+    wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi},
+};
 use mipidsi::{
     interface::SpiInterface,
     models::ILI9342CRgb565,
     options::{ColorInversion, ColorOrder},
     Builder,
 };
+
+// ビルド時にプロジェクト直下の cfg.toml から読み込まれる設定。
+// cfg.toml は .gitignore 済み(cfg.toml.example からコピーして作る)
+#[toml_cfg::toml_config]
+pub struct Config {
+    #[default("")]
+    wifi_ssid: &'static str,
+    #[default("")]
+    wifi_pass: &'static str,
+}
 
 // CoreS3 内蔵I2Cバス上のデバイスアドレス
 const AXP2101_ADDR: u8 = 0x34; // 電源管理IC
@@ -125,7 +142,64 @@ fn main() {
     }
     log::info!("描画完了: 上からRED/GREEN/BLUEの3色バーが表示されているはず");
 
-    // ---- 7. タッチ(FT6336)をポーリングして、触った場所に白丸を描く ----
+    // ---- 7. Wi-Fi接続 ----
+    let text_style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+    if CONFIG.wifi_ssid.is_empty() {
+        Text::new("cfg.toml niSSID wo kinyuu", Point::new(10, 225), text_style)
+            .draw(&mut display)
+            .expect("テキスト描画に失敗");
+        panic!("cfg.tomlにWi-FiのSSID/パスワードを記入してください(cfg.toml.example参照)");
+    }
+    Text::new("WiFi connecting...", Point::new(10, 225), text_style)
+        .draw(&mut display)
+        .expect("テキスト描画に失敗");
+
+    let sys_loop = EspSystemEventLoop::take().expect("イベントループの取得に失敗");
+    let nvs = EspDefaultNvsPartition::take().expect("NVSパーティションの取得に失敗");
+    let mut wifi = BlockingWifi::wrap(
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs)).expect("Wi-Fiドライバの初期化に失敗"),
+        sys_loop,
+    )
+    .expect("BlockingWifiの生成に失敗");
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+        ssid: CONFIG.wifi_ssid.try_into().expect("SSIDが長すぎる(最大32文字)"),
+        password: CONFIG.wifi_pass.try_into().expect("パスワードが長すぎる(最大64文字)"),
+        ..Default::default()
+    }))
+    .expect("Wi-Fi設定に失敗");
+    wifi.start().expect("Wi-Fi起動に失敗");
+    // 初回接続はタイムアウトすることがあるのでリトライする
+    let mut attempt = 1;
+    loop {
+        match wifi.connect() {
+            Ok(()) => break,
+            Err(e) if attempt < 5 => {
+                log::warn!("Wi-Fi接続失敗({attempt}回目): {e}。3秒後に再試行");
+                attempt += 1;
+                FreeRtos::delay_ms(3000);
+            }
+            Err(e) => panic!("Wi-Fi接続に5回失敗: {e}。SSID/パスワードと2.4GHz帯かを確認"),
+        }
+    }
+    wifi.wait_netif_up().expect("IPアドレス取得待ちに失敗");
+    let ip_info = wifi
+        .wifi()
+        .sta_netif()
+        .get_ip_info()
+        .expect("IP情報の取得に失敗");
+    log::info!("Wi-Fi接続完了: IP = {}", ip_info.ip);
+
+    // 接続表示を塗りつぶしてからIPアドレスを画面に表示
+    Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+        .draw(&mut display)
+        .expect("描画に失敗");
+    let ip_text = format!("IP: {}", ip_info.ip);
+    Text::new(&ip_text, Point::new(10, 225), text_style)
+        .draw(&mut display)
+        .expect("テキスト描画に失敗");
+
+    // ---- 8. タッチ(FT6336)をポーリングして、触った場所に白丸を描く ----
     // FT6336のリセット線はAW9523のP0_0。上の初期化でHighにしているので既に動いている
     let mut was_touched = false;
     loop {
