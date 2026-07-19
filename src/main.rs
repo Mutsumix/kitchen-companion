@@ -1,7 +1,7 @@
 use embedded_graphics::{
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Circle, PrimitiveStyle, Rectangle},
 };
 use esp_idf_hal::{
     delay::{Delay, FreeRtos, BLOCK},
@@ -21,6 +21,7 @@ use mipidsi::{
 // CoreS3 内蔵I2Cバス上のデバイスアドレス
 const AXP2101_ADDR: u8 = 0x34; // 電源管理IC
 const AW9523_ADDR: u8 = 0x58; // IOエキスパンダ
+const FT6336_ADDR: u8 = 0x38; // 静電タッチコントローラ
 
 fn main() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
@@ -124,7 +125,30 @@ fn main() {
     }
     log::info!("描画完了: 上からRED/GREEN/BLUEの3色バーが表示されているはず");
 
+    // ---- 7. タッチ(FT6336)をポーリングして、触った場所に白丸を描く ----
+    // FT6336のリセット線はAW9523のP0_0。上の初期化でHighにしているので既に動いている
+    let mut was_touched = false;
     loop {
-        FreeRtos::delay_ms(1000);
+        // レジスタ0x02(タッチ点数)から5バイト連続読み: 点数, X上位, X下位, Y上位, Y下位
+        let mut buf = [0u8; 5];
+        i2c.write_read(FT6336_ADDR, &[0x02], &mut buf, BLOCK)
+            .expect("FT6336の読み取りに失敗");
+        let touches = buf[0] & 0x0F;
+        if touches > 0 {
+            // 座標は12bit。上位バイトは下位4bitのみ有効(上位2bitはイベントフラグ)
+            let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
+            let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
+            if !was_touched {
+                log::info!("タッチ検出: x={x}, y={y}");
+                was_touched = true;
+            }
+            Circle::with_center(Point::new(x, y), 12)
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
+                .draw(&mut display)
+                .expect("丸の描画に失敗");
+        } else {
+            was_touched = false;
+        }
+        FreeRtos::delay_ms(20);
     }
 }
