@@ -23,6 +23,24 @@ error: unexpected argument '--port' found
 - **原因**: `--port` は cargo のオプションではなく、runner(espflash)のオプション。cargo に渡す引数と runner に渡す引数は `--` で区切る
 - **回避策**: `cargo run -- --port /dev/cu.usbmodem1101` とする。ポートが1つしか無い場合は espflash が自動検出するので省略も可
 
+## 2026-07-19: esp-idf-hal 0.46 で `prelude` モジュールが廃止されている
+
+ネット上のサンプルコードによくある `use esp_idf_hal::prelude::*;` が 0.46.2(git版)ではコンパイルエラーになる。
+
+```
+error[E0432]: unresolved import `esp_idf_hal::prelude`
+  --> src/main.rs:11:5
+   |
+11 |     prelude::*,
+   |     ^^^^^^^ could not find `prelude` in `esp_idf_hal`
+
+error[E0689]: can't call method `kHz` on ambiguous numeric type `{integer}`
+```
+
+- **原因**: esp-idf-hal の破壊的変更で prelude が削除された。`.kHz()` / `.MHz()` などの単位変換メソッドは prelude 経由で入っていた
+- **回避策**: `use esp_idf_hal::units::FromValueType;` を明示的にインポートする
+- **教訓**: esp-idf-hal 系は破壊的変更が多い。ネットのサンプルはバージョン確認必須
+
 ## (事前調査で判明)SDカードは FAT32 必須
 
 CoreS3 で使う SD カードは FAT32 でフォーマットされている必要がある。64GB 以上のカードは標準で exFAT のため、そのままでは認識しない。16GB(FAT32)を使用する。
