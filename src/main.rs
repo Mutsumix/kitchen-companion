@@ -30,6 +30,11 @@ use mipidsi::{
     options::{ColorInversion, ColorOrder},
     Builder,
 };
+use u8g2_fonts::{
+    fonts,
+    types::{FontColor, HorizontalAlignment, VerticalPosition},
+    FontRenderer,
+};
 
 // ビルド時にプロジェクト直下の cfg.toml から読み込まれる設定。
 // cfg.toml は .gitignore 済み(cfg.toml.example からコピーして作る)
@@ -68,6 +73,8 @@ fn talk(
     url: &str,
     pcm: &[u8],
     sample_rate: u32,
+    mode: Mode,
+    new_session: bool,
 ) -> Result<(u16, String, Vec<u8>), esp_idf_svc::sys::EspError> {
     let header = wav_header(pcm.len() as u32, sample_rate);
     let mut conn = EspHttpConnection::new(&HttpConfig {
@@ -78,11 +85,15 @@ fn talk(
         ..Default::default()
     })?;
     let len = (header.len() + pcm.len()).to_string();
-    conn.initiate_request(
-        Method::Post,
-        url,
-        &[("Content-Type", "audio/wav"), ("Content-Length", &len)],
-    )?;
+    let mut headers = vec![
+        ("Content-Type", "audio/wav"),
+        ("Content-Length", len.as_str()),
+        ("X-Mode", mode.header_value()),
+    ];
+    if new_session {
+        headers.push(("X-New-Session", "1"));
+    }
+    conn.initiate_request(Method::Post, url, &headers)?;
     conn.write_all(&header)?;
     conn.write_all(pcm)?;
     conn.initiate_response()?;
@@ -99,6 +110,143 @@ fn talk(
         body.extend_from_slice(&chunk[..n]);
     }
     Ok((status, timing, body))
+}
+
+/// 会話モード。タブで切り替え、Workerへ X-Mode ヘッダで伝える
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Consult,  // レシピを一緒に考える
+    Shopping, // 在庫を聞き溜めて買い物リストを作る
+    Cooking,  // 調理手順を1ステップずつ案内
+}
+
+impl Mode {
+    const ALL: [Mode; 3] = [Mode::Consult, Mode::Shopping, Mode::Cooking];
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Consult => "相談",
+            Mode::Shopping => "買出し",
+            Mode::Cooking => "調理中",
+        }
+    }
+    fn header_value(self) -> &'static str {
+        match self {
+            Mode::Consult => "consult",
+            Mode::Shopping => "shopping",
+            Mode::Cooking => "cooking",
+        }
+    }
+}
+
+/// 顔の状態。今は文字表示のプレースホルダ(将来スプライトに差し替え)
+#[derive(Clone, Copy, PartialEq)]
+enum FaceState {
+    Idle,      // 待機
+    Listening, // 聞き耳(録音中)
+    Thinking,  // 考え中(クラウド往復待ち)
+    Speaking,  // 話し中(応答再生中)
+}
+
+impl FaceState {
+    fn label(self) -> &'static str {
+        match self {
+            FaceState::Idle => "待機",
+            FaceState::Listening => "聞き耳",
+            FaceState::Thinking => "考え中",
+            FaceState::Speaking => "話し中",
+        }
+    }
+}
+
+// 画面レイアウト(320x240)
+// y   0- 30: モードタブ3つ / y  30-185: 顔エリア /
+// y 185-205: 音量メーター / y 205-240: ステータス行+「新規」ボタン
+const TAB_H: u32 = 30;
+const FACE_Y: i32 = 30;
+const FACE_H: u32 = 155;
+const METER_Y: i32 = 185;
+const STATUS_Y: i32 = 205;
+const NEW_BTN_X: i32 = 252;
+
+fn draw_tabs<D>(d: &mut D, font: &FontRenderer, active: Mode)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    for (i, m) in Mode::ALL.iter().enumerate() {
+        let x = i as i32 * 107;
+        let (bg, fg) = if *m == active {
+            (Rgb565::WHITE, Rgb565::BLACK)
+        } else {
+            (Rgb565::new(4, 8, 4), Rgb565::WHITE)
+        };
+        Rectangle::new(Point::new(x, 0), Size::new(106, TAB_H))
+            .into_styled(PrimitiveStyle::with_fill(bg))
+            .draw(d)
+            .expect("タブ描画に失敗");
+        font.render_aligned(
+            m.label(),
+            Point::new(x + 53, TAB_H as i32 / 2),
+            VerticalPosition::Center,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(fg),
+            d,
+        )
+        .expect("タブ文字の描画に失敗");
+    }
+}
+
+fn draw_face<D>(d: &mut D, font: &FontRenderer, state: FaceState)
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    Rectangle::new(Point::new(0, FACE_Y), Size::new(320, FACE_H))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(d)
+        .expect("顔エリアの描画に失敗");
+    font.render_aligned(
+        state.label(),
+        Point::new(160, FACE_Y + FACE_H as i32 / 2),
+        VerticalPosition::Center,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        d,
+    )
+    .expect("状態文字の描画に失敗");
+}
+
+fn draw_status<D>(
+    d: &mut D,
+    ascii: MonoTextStyle<'_, Rgb565>,
+    font: &FontRenderer,
+    msg: &str,
+    bg: Rgb565,
+) where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    Rectangle::new(Point::new(0, STATUS_Y), Size::new(320, 35))
+        .into_styled(PrimitiveStyle::with_fill(bg))
+        .draw(d)
+        .expect("ステータス描画に失敗");
+    Text::new(msg, Point::new(6, STATUS_Y + 22), ascii)
+        .draw(d)
+        .expect("ステータス文字の描画に失敗");
+    // 「新規」ボタン(セッションを仕切り直す)
+    Rectangle::new(Point::new(NEW_BTN_X, STATUS_Y + 3), Size::new(64, 29))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(d)
+        .expect("新規ボタンの描画に失敗");
+    font.render_aligned(
+        "新規",
+        Point::new(NEW_BTN_X + 32, STATUS_Y + 17),
+        VerticalPosition::Center,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        d,
+    )
+    .expect("新規ボタン文字の描画に失敗");
 }
 
 // CoreS3 内蔵I2Cバス上のデバイスアドレス
@@ -197,32 +345,22 @@ fn main() {
         .expect("LCDの初期化に失敗");
     log::info!("LCD初期化完了");
 
-    // ---- 6. RGB3色バーを描画(色順設定の誤りを目視検出できるように) ----
+    // ---- 6. 初期画面(タブ+顔プレースホルダ) ----
+    // ※開発初期はここでRGB3色バーを描いて色順(Bgr+Inverted)を検証していた(manual.md 3章)
     display.clear(Rgb565::BLACK).expect("画面クリアに失敗");
-    let bars = [
-        (Rgb565::RED, 0),
-        (Rgb565::GREEN, 80),
-        (Rgb565::BLUE, 160),
-    ];
-    for (color, y) in bars {
-        Rectangle::new(Point::new(0, y), Size::new(320, 80))
-            .into_styled(PrimitiveStyle::with_fill(color))
-            .draw(&mut display)
-            .expect("バーの描画に失敗");
-    }
-    log::info!("描画完了: 上からRED/GREEN/BLUEの3色バーが表示されているはず");
+    let jp_font = FontRenderer::new::<fonts::u8g2_font_b16_t_japanese1>();
+    let mut mode = Mode::Consult;
+    draw_tabs(&mut display, &jp_font, mode);
+    draw_face(&mut display, &jp_font, FaceState::Idle);
+    log::info!("初期画面の描画完了");
 
     // ---- 7. Wi-Fi接続 ----
     let text_style = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
     if CONFIG.wifi_ssid.is_empty() {
-        Text::new("cfg.toml niSSID wo kinyuu", Point::new(10, 225), text_style)
-            .draw(&mut display)
-            .expect("テキスト描画に失敗");
+        draw_status(&mut display, text_style, &jp_font, "cfg.toml: SSID missing", Rgb565::RED);
         panic!("cfg.tomlにWi-FiのSSID/パスワードを記入してください(cfg.toml.example参照)");
     }
-    Text::new("WiFi connecting...", Point::new(10, 225), text_style)
-        .draw(&mut display)
-        .expect("テキスト描画に失敗");
+    draw_status(&mut display, text_style, &jp_font, "WiFi connecting...", Rgb565::BLUE);
 
     let sys_loop = EspSystemEventLoop::take().expect("イベントループの取得に失敗");
     let nvs = EspDefaultNvsPartition::take().expect("NVSパーティションの取得に失敗");
@@ -260,14 +398,8 @@ fn main() {
     log::info!("Wi-Fi接続完了: IP = {}", ip_info.ip);
 
     // 接続表示を塗りつぶしてからIPアドレスを画面に表示
-    Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut display)
-        .expect("描画に失敗");
     let ip_text = format!("IP: {}", ip_info.ip);
-    Text::new(&ip_text, Point::new(10, 225), text_style)
-        .draw(&mut display)
-        .expect("テキスト描画に失敗");
+    draw_status(&mut display, text_style, &jp_font, &ip_text, Rgb565::BLUE);
 
     // ---- 8. ES7210(マイクADC)をI2Cで初期化 ----
     // レジスタ値はM5Unifiedの実績値。マイク1/2(前面デュアルマイク)を有効化し、
@@ -367,9 +499,13 @@ fn main() {
     // ---- 11. メインループ: 音量レベルメーター + プッシュ・トゥ・トーク ----
     // 512フレーム(ステレオ16bit=2048バイト)ずつ読む。16kHzなので1回あたり32ms
     let mut audio_buf = [0u8; 2048];
-    let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
+    let meter_area = Rectangle::new(Point::new(0, METER_Y), Size::new(320, 20));
     let mut was_touched = false;
     let mut prev_bar_width = 0u32;
+    // 顔の状態と、セッション仕切り直しの予約フラグ
+    let mut face = FaceState::Idle;
+    let mut new_session = false;
+    let mut response_playing = false;
     // 再生キュー。Some((データ, 送信済みバイト数))=再生中、None=停止中。
     // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
     let mut playback: Option<(Vec<u8>, usize)> = None;
@@ -411,31 +547,47 @@ fn main() {
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
                 .draw(&mut display)
                 .expect("メーター背景の描画に失敗");
-            Rectangle::new(Point::new(0, 180), Size::new(bar_width, 20))
+            Rectangle::new(Point::new(0, METER_Y), Size::new(bar_width, 20))
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
                 .draw(&mut display)
                 .expect("メーターの描画に失敗");
             prev_bar_width = bar_width;
         }
 
-        // --- プッシュ・トゥ・トーク: 押している間だけ録音、離したら送信 ---
-        let mut buf = [0u8; 1];
+        // --- タッチ処理: タブ切替 / 顔エリア=プッシュ・トゥ・トーク / 新規ボタン ---
+        let mut buf = [0u8; 5];
         i2c.write_read(FT6336_ADDR, &[0x02], &mut buf, BLOCK)
             .expect("FT6336の読み取りに失敗");
         let touched_now = (buf[0] & 0x0F) > 0;
+        let tx = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
+        let ty = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
 
-        // 押した瞬間: ビープ→録音開始(応答再生中は無視)
+        // 押した瞬間の処理(録音中・再生中は新規操作を受け付けない)
         if touched_now && !was_touched && recording.is_none() && playback.is_none() {
-            log::info!("タッチ検出 → 録音開始(離すまで最大15秒)");
-            playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
-            recording = Some(Vec::with_capacity(MAX_RECORD_BYTES));
-            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-                .draw(&mut display)
-                .expect("描画に失敗");
-            Text::new("REC... release to send", Point::new(10, 225), text_style)
-                .draw(&mut display)
-                .expect("テキスト描画に失敗");
+            if ty < TAB_H as i32 {
+                // モードタブ
+                let selected = Mode::ALL[(tx / 107).clamp(0, 2) as usize];
+                if selected != mode {
+                    mode = selected;
+                    log::info!("モード切替: {}", mode.header_value());
+                    draw_tabs(&mut display, &jp_font, mode);
+                    let msg = format!("Mode: {}", mode.header_value());
+                    draw_status(&mut display, text_style, &jp_font, &msg, Rgb565::BLUE);
+                }
+            } else if ty >= STATUS_Y && tx >= NEW_BTN_X {
+                // 新規セッションボタン: 次の発話から履歴を仕切り直す
+                new_session = true;
+                log::info!("新規セッション予約");
+                draw_status(&mut display, text_style, &jp_font, "New session: next talk", Rgb565::BLUE);
+            } else if ty >= FACE_Y && ty < METER_Y {
+                // 顔エリア: プッシュ・トゥ・トーク開始
+                log::info!("タッチ検出 → 録音開始(離すまで最大15秒)");
+                playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
+                recording = Some(Vec::with_capacity(MAX_RECORD_BYTES));
+                face = FaceState::Listening;
+                draw_face(&mut display, &jp_font, face);
+                draw_status(&mut display, text_style, &jp_font, "REC... release to send", Rgb565::RED);
+            }
         }
 
         // 離した瞬間 or 上限到達で録音終了。短すぎる場合はキャンセル
@@ -447,13 +599,9 @@ fn main() {
             } else if released {
                 log::info!("録音が短すぎるためキャンセル({}バイト)", pcm.len());
                 recording = None;
-                Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-                    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-                    .draw(&mut display)
-                    .expect("描画に失敗");
-                Text::new("Too short - canceled", Point::new(10, 225), text_style)
-                    .draw(&mut display)
-                    .expect("テキスト描画に失敗");
+                face = FaceState::Idle;
+                draw_face(&mut display, &jp_font, face);
+                draw_status(&mut display, text_style, &jp_font, "Too short - canceled", Rgb565::BLUE);
             }
         }
         was_touched = touched_now;
@@ -472,22 +620,24 @@ fn main() {
             }
             if *pos >= data.len() {
                 playback = None;
+                // 応答の再生が終わったら顔を待機に戻す
+                if response_playing {
+                    response_playing = false;
+                    face = FaceState::Idle;
+                    draw_face(&mut display, &jp_font, face);
+                }
             }
         }
 
         // --- 録音が確定したらWAV化して中継WorkerへPOST ---
         if let Some(pcm) = finished {
             log::info!("録音完了({}バイト)。送信開始: {}", pcm.len(), CONFIG.server_url);
-            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-                .draw(&mut display)
-                .expect("描画に失敗");
-            Text::new("Sending...", Point::new(10, 225), text_style)
-                .draw(&mut display)
-                .expect("テキスト描画に失敗");
+            face = FaceState::Thinking;
+            draw_face(&mut display, &jp_font, face);
+            draw_status(&mut display, text_style, &jp_font, "Sending...", Rgb565::BLUE);
 
             let started = std::time::Instant::now();
-            let result = talk(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ);
+            let result = talk(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ, mode, new_session);
             let elapsed_ms = started.elapsed().as_millis();
             let msg = match result {
                 Ok((200, timing, body)) => {
@@ -503,22 +653,24 @@ fn main() {
                         stereo.extend_from_slice(s);
                     }
                     playback = Some((stereo, 0));
+                    new_session = false; // 仕切り直しが伝わったのでフラグを下ろす
+                    response_playing = true;
+                    face = FaceState::Speaking;
                     format!("OK {elapsed_ms}ms (dev) / {timing}")
                 }
-                Ok((status, _, _)) => format!("Relay error: {status} ({elapsed_ms}ms)"),
+                Ok((status, _, _)) => {
+                    face = FaceState::Idle;
+                    format!("Relay error: {status} ({elapsed_ms}ms)")
+                }
                 Err(e) => {
                     log::error!("送信失敗: {e}");
+                    face = FaceState::Idle;
                     format!("Send FAILED ({elapsed_ms}ms)")
                 }
             };
             log::info!("往復結果: {msg}");
-            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-                .draw(&mut display)
-                .expect("描画に失敗");
-            Text::new(&msg, Point::new(10, 225), text_style)
-                .draw(&mut display)
-                .expect("テキスト描画に失敗");
+            draw_face(&mut display, &jp_font, face);
+            draw_status(&mut display, text_style, &jp_font, &msg, Rgb565::BLUE);
         }
     }
 }

@@ -964,6 +964,7 @@ dependencies = [
  "log",
  "mipidsi",
  "toml-cfg",
+ "u8g2-fonts",
 ]
 
 [[package]]
@@ -1561,6 +1562,15 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "u8g2-fonts"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ce3199e4c7d98a0a47ddd5ae9cde5a4e944d316319e3208527de504f4e76032"
+dependencies = [
+ "embedded-graphics-core",
+]
 
 [[package]]
 name = "uncased"

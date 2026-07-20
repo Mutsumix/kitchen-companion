@@ -4,3 +4,8 @@ compatibility_date = "2026-07-01"
 
 # APIキーはコードや設定ファイルに書かない。デプロイ後に以下で登録する:
 #   npx wrangler secret put OPENAI_API_KEY
+
+# 会話履歴セッション用KV(作成: npx wrangler kv namespace create HISTORY)
+[[kv_namespaces]]
+binding = "HISTORY"
+id = "aec34d0486164f4fb728c76db7c7d1bf"
