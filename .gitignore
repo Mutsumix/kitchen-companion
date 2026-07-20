@@ -4,3 +4,4 @@
 .DS_Store
 # Wi-Fi認証情報など秘密設定(cfg.toml.exampleからコピーして作る)
 /cfg.toml
+recordings/

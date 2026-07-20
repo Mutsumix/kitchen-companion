@@ -19,6 +19,8 @@ use esp_idf_hal::{
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
+    http::client::{Configuration as HttpConfig, EspHttpConnection},
+    http::Method,
     nvs::EspDefaultNvsPartition,
     wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi},
 };
@@ -37,6 +39,44 @@ pub struct Config {
     wifi_ssid: &'static str,
     #[default("")]
     wifi_pass: &'static str,
+    #[default("")]
+    server_url: &'static str,
+}
+
+/// モノラル16bit PCM用の44バイトWAVヘッダを作る
+fn wav_header(pcm_len: u32, sample_rate: u32) -> [u8; 44] {
+    let byte_rate = sample_rate * 2; // モノラル16bit
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36 + pcm_len).to_le_bytes());
+    h[8..16].copy_from_slice(b"WAVEfmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes()); // fmtチャンクサイズ
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&1u16.to_le_bytes()); // モノラル
+    h[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    h[32..34].copy_from_slice(&2u16.to_le_bytes()); // ブロックアライン
+    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // ビット深度
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&pcm_len.to_le_bytes());
+    h
+}
+
+/// PCMをWAVとしてHTTP POSTしてステータスコードを返す。
+/// ヘッダと本体を別々に書き込み、結合バッファを作らない(メモリ節約)
+fn post_wav(url: &str, pcm: &[u8], sample_rate: u32) -> Result<u16, esp_idf_svc::sys::EspError> {
+    let header = wav_header(pcm.len() as u32, sample_rate);
+    let mut conn = EspHttpConnection::new(&HttpConfig::default())?;
+    let len = (header.len() + pcm.len()).to_string();
+    conn.initiate_request(
+        Method::Post,
+        url,
+        &[("Content-Type", "audio/wav"), ("Content-Length", &len)],
+    )?;
+    conn.write_all(&header)?;
+    conn.write_all(pcm)?;
+    conn.initiate_response()?;
+    Ok(conn.status())
 }
 
 // CoreS3 内蔵I2Cバス上のデバイスアドレス
@@ -310,6 +350,9 @@ fn main() {
     // ビープの再生位置。Some(n)=再生中(nバイト目まで送信済み)、None=停止中。
     // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
     let mut beep_pos: Option<usize> = None;
+    // 録音バッファ。Some=録音中(モノラル16bit PCMを蓄積)、None=待機中
+    const RECORD_BYTES: usize = (SAMPLE_RATE_HZ as usize) * 2 * 3; // 3秒ぶん
+    let mut recording: Option<Vec<u8>> = None;
     loop {
         // --- 録音データを読んでRMS音量を計算 ---
         let n = i2s.read(&mut audio_buf, BLOCK).expect("I2S読み取りに失敗");
@@ -320,6 +363,14 @@ fn main() {
             let sample = i16::from_le_bytes([frame[0], frame[1]]) as i64;
             sum_sq += sample * sample;
             count += 1;
+            // 録音中(かつビープ再生が終わってから)はモノラルPCMとして蓄積
+            if beep_pos.is_none() {
+                if let Some(pcm) = recording.as_mut() {
+                    if pcm.len() < RECORD_BYTES {
+                        pcm.extend_from_slice(&frame[..2]);
+                    }
+                }
+            }
         }
         let rms = if count > 0 {
             ((sum_sq / count) as f32).sqrt()
@@ -351,9 +402,20 @@ fn main() {
             let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
             let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
             if !was_touched {
-                log::info!("タッチ検出: x={x}, y={y} → ビープ再生開始");
                 was_touched = true;
-                beep_pos = Some(0); // 実際の送信はループ末尾で小分けに行う
+                // 録音中でなければ、ビープ→3秒録音を開始
+                if recording.is_none() {
+                    log::info!("タッチ検出: x={x}, y={y} → ビープ後3秒録音");
+                    beep_pos = Some(0); // 実際の送信はループ末尾で小分けに行う
+                    recording = Some(Vec::with_capacity(RECORD_BYTES));
+                    Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+                        .draw(&mut display)
+                        .expect("描画に失敗");
+                    Text::new("REC...", Point::new(10, 225), text_style)
+                        .draw(&mut display)
+                        .expect("テキスト描画に失敗");
+                }
             }
             Circle::with_center(Point::new(x, y), 12)
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
@@ -370,6 +432,38 @@ fn main() {
             let written = i2s.write(&beep[pos..], 0).expect("I2S書き込みに失敗");
             let next = pos + written;
             beep_pos = if next >= beep.len() { None } else { Some(next) };
+        }
+
+        // --- 3秒ぶん録音が溜まったらWAV化してMacへPOST ---
+        if recording.as_ref().is_some_and(|pcm| pcm.len() >= RECORD_BYTES) {
+            let pcm = recording.take().unwrap();
+            log::info!("録音完了({}バイト)。送信開始: {}", pcm.len(), CONFIG.server_url);
+            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+                .draw(&mut display)
+                .expect("描画に失敗");
+            Text::new("Sending...", Point::new(10, 225), text_style)
+                .draw(&mut display)
+                .expect("テキスト描画に失敗");
+
+            let started = std::time::Instant::now();
+            let result = post_wav(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ);
+            let elapsed_ms = started.elapsed().as_millis();
+            let msg = match result {
+                Ok(status) => format!("Sent: {status} ({elapsed_ms}ms)"),
+                Err(e) => {
+                    log::error!("送信失敗: {e}");
+                    format!("Send FAILED ({elapsed_ms}ms)")
+                }
+            };
+            log::info!("送信結果: {msg}");
+            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+                .draw(&mut display)
+                .expect("描画に失敗");
+            Text::new(&msg, Point::new(10, 225), text_style)
+                .draw(&mut display)
+                .expect("テキスト描画に失敗");
         }
     }
 }
