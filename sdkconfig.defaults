@@ -13,6 +13,11 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # `std::thread::Builder::new().stack_size(XXX)` for spawning
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
+# TCP送受信バッファ拡大。デフォルト(約5.7KB)だと、RTT200ms環境(Wi-Fi中継器経由)で
+# 155KBの音声アップロードに4〜5秒かかっていた(帯域遅延積の問題)
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
+CONFIG_LWIP_TCP_WND_DEFAULT=65534
+
 # CoreS3は8MBのPSRAMを搭載。接続はQuadモード(Octal指定だと認識に失敗する)
 # 有効化しないと内蔵RAM約330KBのみで、録音バッファ等の大きな確保が失敗する
 CONFIG_SPIRAM=y

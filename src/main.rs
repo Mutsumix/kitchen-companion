@@ -1,4 +1,5 @@
 use embedded_graphics::{
+    image::{Image, ImageRaw},
     mono_font::{ascii::FONT_10X20, MonoTextStyle},
     pixelcolor::Rgb565,
     prelude::*,
@@ -10,7 +11,10 @@ use esp_idf_hal::{
     gpio::{AnyIOPin, PinDriver},
     i2c::{I2cConfig, I2cDriver},
     i2s::{
-        config::{DataBitWidth, StdConfig},
+        config::{
+            Config as I2sChanConfig, DataBitWidth, SlotMode, StdClkConfig, StdConfig,
+            StdGpioConfig, StdSlotConfig,
+        },
         I2sDriver,
     },
     peripherals::Peripherals,
@@ -67,23 +71,39 @@ fn wav_header(pcm_len: u32, sample_rate: u32) -> [u8; 44] {
     h
 }
 
-/// 録音PCMをWAVとして中継WorkerにPOSTし、(ステータス, タイミング情報, 応答音声PCM)を返す。
-/// WAVヘッダと本体は別々に書き込み、結合バッファを作らない(メモリ節約)
-fn talk(
+/// 録音PCMをWAVとして中継WorkerにPOSTし、応答音声(16kHzモノラルPCM)を
+/// **受信しながらそのままI2Sへ流して再生する**(ストリーミング再生)。
+/// 再生中もタッチを監視し、押されたら受信を打ち切って戻る(割り込み)。
+/// 戻り値: (HTTPステータス, 割り込みされたか)
+fn talk<D>(
     url: &str,
     pcm: &[u8],
     sample_rate: u32,
     mode: Mode,
     new_session: bool,
-) -> Result<(u16, String, Vec<u8>), esp_idf_svc::sys::EspError> {
+    character: usize,
+    i2s: &mut I2sDriver<'_, esp_idf_hal::i2s::I2sBiDir>,
+    i2c: &mut I2cDriver<'_>,
+    display: &mut D,
+    conn_slot: &mut Option<EspHttpConnection>,
+) -> Result<(u16, bool), esp_idf_svc::sys::EspError>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
     let header = wav_header(pcm.len() as u32, sample_rate);
-    let mut conn = EspHttpConnection::new(&HttpConfig {
-        // HTTPSに必要なルート証明書バンドル(ESP-IDF組み込み)
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        // STT→LLM→TTSで6秒超かかるため、デフォルトの数秒では足りない
-        timeout: Some(core::time::Duration::from_secs(30)),
-        ..Default::default()
-    })?;
+    // TLS接続は前回のものを使い回す(毎回のハンドシェイク約1.5秒を節約)。
+    // エラーや割り込みで中途半端になった接続は捨てて、次回作り直す
+    let mut conn = match conn_slot.take() {
+        Some(c) => c,
+        None => EspHttpConnection::new(&HttpConfig {
+            // HTTPSに必要なルート証明書バンドル(ESP-IDF組み込み)
+            crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+            // STT+ストリーミング応答全体をカバーするタイムアウト
+            timeout: Some(core::time::Duration::from_secs(60)),
+            ..Default::default()
+        })?,
+    };
     let len = (header.len() + pcm.len()).to_string();
     let mut headers = vec![
         ("Content-Type", "audio/wav"),
@@ -98,18 +118,65 @@ fn talk(
     conn.write_all(pcm)?;
     conn.initiate_response()?;
     let status = conn.status();
+    if status != 200 {
+        // エラー時はボディを読み捨てて戻る(接続は再利用可能なので返却)
+        let mut sink = [0u8; 1024];
+        while conn.read(&mut sink)? > 0 {}
+        *conn_slot = Some(conn);
+        return Ok((status, false));
+    }
+
     let timing = conn.header("X-Timing").unwrap_or_default().to_string();
-    // 応答ボディ(16kHzモノラルPCM)を読み切る。TTS音声は数百KBになるためPSRAM頼み
-    let mut body = Vec::with_capacity(256 * 1024);
+    log::info!("応答ストリーム開始 / {timing}");
+
+    // モノラルPCMを受信 → ステレオ化 → I2Sへ書き込み(ブロッキング=再生ペースで進む)
     let mut chunk = [0u8; 4096];
+    let mut stereo = [0u8; 8192 + 4]; // 4096バイト分のステレオ+端数余裕
+    let mut carry: Option<u8> = None; // チャンク境界でサンプルが割れたときの持ち越し
+    // 口パクアニメーション(音声バッファに500msの蓄えがあるため、描画時間は吸収される)
+    let mut anim_frame: usize = 0;
+    let mut last_anim = std::time::Instant::now();
     loop {
         let n = conn.read(&mut chunk)?;
         if n == 0 {
-            break;
+            break; // ストリーム終端
         }
-        body.extend_from_slice(&chunk[..n]);
+        // 持ち越しバイトと連結してから16bitサンプル単位で処理
+        let mut mono: Vec<u8> = Vec::with_capacity(n + 1);
+        if let Some(b) = carry.take() {
+            mono.push(b);
+        }
+        mono.extend_from_slice(&chunk[..n]);
+        let pairs = mono.len() / 2;
+        if mono.len() % 2 == 1 {
+            carry = Some(mono[mono.len() - 1]);
+        }
+        let mut out = 0;
+        for s in mono[..pairs * 2].chunks_exact(2) {
+            stereo[out..out + 2].copy_from_slice(s); // 左ch
+            stereo[out + 2..out + 4].copy_from_slice(s); // 右ch
+            out += 4;
+        }
+        i2s.write_all(&stereo[..out], BLOCK)?;
+
+        // 割り込みチェック: 再生中にタッチされたら受信を打ち切る
+        let mut tbuf = [0u8; 1];
+        i2c.write_read(FT6336_ADDR, &[0x02], &mut tbuf, BLOCK)?;
+        if (tbuf[0] & 0x0F) > 0 {
+            log::info!("割り込みタッチ検出 → ストリーム再生を中断");
+            // 応答を読み切っていない接続は再利用できないので捨てる(次回作り直し)
+            return Ok((status, true));
+        }
+
+        // 口パク(250msごとにフレーム送り)
+        if FACE_SPRITES_ENABLED && last_anim.elapsed().as_millis() > 250 {
+            anim_frame = (anim_frame + 1) % 3;
+            draw_face(display, character, FaceState::Speaking, anim_frame);
+            last_anim = std::time::Instant::now();
+        }
     }
-    Ok((status, timing, body))
+    *conn_slot = Some(conn); // 読み切った接続は次回に再利用
+    Ok((status, false))
 }
 
 /// 会話モード。タブで切り替え、Workerへ X-Mode ヘッダで伝える
@@ -148,25 +215,62 @@ enum FaceState {
 }
 
 impl FaceState {
-    fn label(self) -> &'static str {
+    fn index(self) -> usize {
         match self {
-            FaceState::Idle => "待機",
-            FaceState::Listening => "聞き耳",
-            FaceState::Thinking => "考え中",
-            FaceState::Speaking => "話し中",
+            FaceState::Idle => 0,
+            FaceState::Listening => 1,
+            FaceState::Thinking => 2,
+            FaceState::Speaking => 3,
         }
     }
 }
 
+// 顔スプライト(320x155 RGB565ビッグエンディアン)。作者制作のPNGを
+// tools/face_convert.py で変換したもの。[キャラ][状態][フレーム]
+// キャラはダブルタップで循環切替(選択はNVSに保存)
+const CHAR_COUNT: usize = 2;
+
+macro_rules! char_frames {
+    ($dir:literal) => {
+        [
+            [
+                include_bytes!(concat!("../assets/face/", $dir, "/idle_0.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/idle_1.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/idle_2.raw")),
+            ],
+            [
+                include_bytes!(concat!("../assets/face/", $dir, "/listen_0.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/listen_1.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/listen_2.raw")),
+            ],
+            [
+                include_bytes!(concat!("../assets/face/", $dir, "/think_0.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/think_1.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/think_2.raw")),
+            ],
+            [
+                include_bytes!(concat!("../assets/face/", $dir, "/speak_0.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/speak_1.raw")),
+                include_bytes!(concat!("../assets/face/", $dir, "/speak_2.raw")),
+            ],
+        ]
+    };
+}
+
+static FACE_FRAMES: [[[&[u8]; 3]; 4]; CHAR_COUNT] =
+    [char_frames!("robo"), char_frames!("girl")];
+
 // 画面レイアウト(320x240)
-// y   0- 30: モードタブ3つ / y  30-185: 顔エリア /
-// y 185-205: 音量メーター / y 205-240: ステータス行+「新規」ボタン
+// y   0- 30: モードタブ3つ / y  30-185: 顔エリア(スプライト320x155ぴったり) /
+// y 185-240: ステータスバー+「新規」ボタン
+// 録音ホールド中はステータスバー全体が横型音量ゲージに切り替わる
 const TAB_H: u32 = 30;
 const FACE_Y: i32 = 30;
 const FACE_H: u32 = 155;
-const METER_Y: i32 = 185;
-const STATUS_Y: i32 = 205;
+const STATUS_Y: i32 = 185;
+const STATUS_H: u32 = 55;
 const NEW_BTN_X: i32 = 252;
+const CHAR_BTN_W: i32 = 48; // 左端のキャラ切替ボタン幅
 
 fn draw_tabs<D>(d: &mut D, font: &FontRenderer, active: Mode)
 where
@@ -196,24 +300,47 @@ where
     }
 }
 
-fn draw_face<D>(d: &mut D, font: &FontRenderer, state: FaceState)
+// スプライト顔の有効/無効。当初、フル描画が遅く応答再生中のアニメーションが
+// I2S送信のDMAアンダーランを起こして音が途切れた。SPIバッファ拡大(512B→12KB)と
+// I2S DMA増強(90ms→500ms分)、および再生ループ内でのアニメーション実行で両立
+const FACE_SPRITES_ENABLED: bool = true;
+
+/// 再生中の口パク: ストリーミング再生ループから呼ばれる
+
+fn draw_face<D>(d: &mut D, character: usize, state: FaceState, frame: usize)
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    Rectangle::new(Point::new(0, FACE_Y), Size::new(320, FACE_H))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-        .draw(d)
-        .expect("顔エリアの描画に失敗");
-    font.render_aligned(
-        state.label(),
-        Point::new(160, FACE_Y + FACE_H as i32 / 2),
-        VerticalPosition::Center,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Rgb565::WHITE),
-        d,
-    )
-    .expect("状態文字の描画に失敗");
+    if FACE_SPRITES_ENABLED {
+        let raw = ImageRaw::<Rgb565>::new(FACE_FRAMES[character][state.index()][frame], 320);
+        Image::new(&raw, Point::new(0, FACE_Y))
+            .draw(d)
+            .expect("顔スプライトの描画に失敗");
+    } else {
+        // 文字プレースホルダ(状態名のみ)
+        let label = match state {
+            FaceState::Idle => "待機",
+            FaceState::Listening => "聞き耳",
+            FaceState::Thinking => "考え中",
+            FaceState::Speaking => "話し中",
+        };
+        Rectangle::new(Point::new(0, FACE_Y), Size::new(320, FACE_H))
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+            .draw(d)
+            .expect("顔エリアの描画に失敗");
+        FontRenderer::new::<fonts::u8g2_font_b16_t_japanese1>()
+            .render_aligned(
+                label,
+                Point::new(160, FACE_Y + FACE_H as i32 / 2),
+                VerticalPosition::Center,
+                HorizontalAlignment::Center,
+                FontColor::Transparent(Rgb565::WHITE),
+                d,
+            )
+            .expect("状態文字の描画に失敗");
+        let _ = frame;
+    }
 }
 
 fn draw_status<D>(
@@ -226,21 +353,37 @@ fn draw_status<D>(
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    Rectangle::new(Point::new(0, STATUS_Y), Size::new(320, 35))
+    Rectangle::new(Point::new(0, STATUS_Y), Size::new(320, STATUS_H))
         .into_styled(PrimitiveStyle::with_fill(bg))
         .draw(d)
         .expect("ステータス描画に失敗");
-    Text::new(msg, Point::new(6, STATUS_Y + 22), ascii)
+    // 左右のボタンに被らないよう最大19文字で打ち切る
+    let clipped: String = msg.chars().take(19).collect();
+    Text::new(&clipped, Point::new(CHAR_BTN_W + 6, STATUS_Y + 33), ascii)
         .draw(d)
         .expect("ステータス文字の描画に失敗");
+    // 「顔」ボタン(キャラ切替。録音ゾーンと完全に分離した専用ボタン)
+    Rectangle::new(Point::new(2, STATUS_Y + 9), Size::new((CHAR_BTN_W - 4) as u32, 37))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+        .draw(d)
+        .expect("顔ボタンの描画に失敗");
+    font.render_aligned(
+        "顔",
+        Point::new(CHAR_BTN_W / 2, STATUS_Y + 27),
+        VerticalPosition::Center,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        d,
+    )
+    .expect("顔ボタン文字の描画に失敗");
     // 「新規」ボタン(セッションを仕切り直す)
-    Rectangle::new(Point::new(NEW_BTN_X, STATUS_Y + 3), Size::new(64, 29))
+    Rectangle::new(Point::new(NEW_BTN_X, STATUS_Y + 9), Size::new(64, 37))
         .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
         .draw(d)
         .expect("新規ボタンの描画に失敗");
     font.render_aligned(
         "新規",
-        Point::new(NEW_BTN_X + 32, STATUS_Y + 17),
+        Point::new(NEW_BTN_X + 32, STATUS_Y + 27),
         VerticalPosition::Center,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::WHITE),
@@ -335,8 +478,10 @@ fn main() {
 
     // ---- 5. LCD(ILI9342C)初期化 ----
     let mut delay = Delay::new_default();
-    let mut buffer = [0u8; 512];
-    let di = SpiInterface::new(spi_device, dc, &mut buffer);
+    // SPI転送用の中間バッファ。512Bだとフル画面描画が約200分割されて遅く、
+    // 顔アニメーション中に音声DMAが枯渇する原因になった。12KB(内蔵RAM)に拡大
+    let buffer: &'static mut [u8] = Box::leak(vec![0u8; 12288].into_boxed_slice());
+    let di = SpiInterface::new(spi_device, dc, buffer);
     let mut display = Builder::new(ILI9342CRgb565, di)
         .display_size(320, 240)
         .color_order(ColorOrder::Bgr)
@@ -345,13 +490,21 @@ fn main() {
         .expect("LCDの初期化に失敗");
     log::info!("LCD初期化完了");
 
-    // ---- 6. 初期画面(タブ+顔プレースホルダ) ----
+    // ---- 6. NVS読み出しと初期画面(タブ+顔) ----
     // ※開発初期はここでRGB3色バーを描いて色順(Bgr+Inverted)を検証していた(manual.md 3章)
+    // NVS(不揮発設定): キャラ選択の永続化。Wi-Fiも同じパーティションを共用する
+    let nvs_part = EspDefaultNvsPartition::take().expect("NVSパーティションの取得に失敗");
+    let mut app_nvs = esp_idf_svc::nvs::EspNvs::new(nvs_part.clone(), "app", true)
+        .expect("NVS名前空間のオープンに失敗");
+    let mut character: usize =
+        app_nvs.get_u8("chara").ok().flatten().unwrap_or(0) as usize % CHAR_COUNT;
+    log::info!("キャラ選択(NVS): {character}");
+
     display.clear(Rgb565::BLACK).expect("画面クリアに失敗");
     let jp_font = FontRenderer::new::<fonts::u8g2_font_b16_t_japanese1>();
     let mut mode = Mode::Consult;
     draw_tabs(&mut display, &jp_font, mode);
-    draw_face(&mut display, &jp_font, FaceState::Idle);
+    draw_face(&mut display, character, FaceState::Idle, 0);
     log::info!("初期画面の描画完了");
 
     // ---- 7. Wi-Fi接続 ----
@@ -363,9 +516,9 @@ fn main() {
     draw_status(&mut display, text_style, &jp_font, "WiFi connecting...", Rgb565::BLUE);
 
     let sys_loop = EspSystemEventLoop::take().expect("イベントループの取得に失敗");
-    let nvs = EspDefaultNvsPartition::take().expect("NVSパーティションの取得に失敗");
     let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs)).expect("Wi-Fiドライバの初期化に失敗"),
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs_part.clone()))
+            .expect("Wi-Fiドライバの初期化に失敗"),
         sys_loop,
     )
     .expect("BlockingWifiの生成に失敗");
@@ -459,7 +612,18 @@ fn main() {
     // ---- 10. I2S双方向(BCLK=GPIO34, WS=GPIO33, DIN=GPIO14, DOUT=GPIO13, MCLK=GPIO0) ----
     // マイク(ES7210)とスピーカー(AW88298)は同じI2Sバスを共有している。
     // ESP32-S3がマスター、16kHz/16bit/ステレオ(マイク1=左, マイク2=右)
-    let i2s_config = StdConfig::philips(SAMPLE_RATE_HZ, DataBitWidth::Bits16);
+    // DMAバッファは8個×1000フレーム=約500ms分(既定は90ms分)。
+    // 描画などでループが数十ms止まっても音声が途切れない余裕を持たせる。
+    // auto_clear=trueで、万一のアンダーラン時は「最後のバッファ繰り返し」ではなく無音になる
+    let i2s_config = StdConfig::new(
+        I2sChanConfig::default()
+            .dma_buffer_count(8)
+            .frames_per_buffer(1000)
+            .auto_clear(true),
+        StdClkConfig::from_sample_rate_hz(SAMPLE_RATE_HZ),
+        StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Stereo),
+        StdGpioConfig::default(),
+    );
     let mut i2s = I2sDriver::new_std_bidir(
         peripherals.i2s1,
         &i2s_config,
@@ -485,7 +649,7 @@ fn main() {
         for n in 0..(tone_frames + silence_frames) {
             let sample = if n < tone_frames {
                 let t = n as f32 / SAMPLE_RATE_HZ as f32;
-                ((t * 1000.0 * 2.0 * core::f32::consts::PI).sin() * 8000.0) as i16
+                ((t * 1000.0 * 2.0 * core::f32::consts::PI).sin() * 1250.0) as i16
             } else {
                 0
             };
@@ -496,16 +660,39 @@ fn main() {
         buf
     };
 
+    // キャラ切替時のチャイム(上昇2音+末尾無音。無音はDMA繰り返し対策で必須)
+    let chime: Vec<u8> = {
+        let mut buf = Vec::new();
+        for (freq, ms) in [(880.0f32, 70usize), (1320.0, 90), (0.0, 150)] {
+            let frames = (SAMPLE_RATE_HZ as usize) * ms / 1000;
+            for n in 0..frames {
+                let t = n as f32 / SAMPLE_RATE_HZ as f32;
+                let sample = if freq > 0.0 {
+                    ((t * freq * 2.0 * core::f32::consts::PI).sin() * 1250.0) as i16
+                } else {
+                    0
+                };
+                let bytes = sample.to_le_bytes();
+                buf.extend_from_slice(&bytes); // 左ch
+                buf.extend_from_slice(&bytes); // 右ch
+            }
+        }
+        buf
+    };
+
     // ---- 11. メインループ: 音量レベルメーター + プッシュ・トゥ・トーク ----
     // 512フレーム(ステレオ16bit=2048バイト)ずつ読む。16kHzなので1回あたり32ms
     let mut audio_buf = [0u8; 2048];
-    let meter_area = Rectangle::new(Point::new(0, METER_Y), Size::new(320, 20));
     let mut was_touched = false;
-    let mut prev_bar_width = 0u32;
+    let mut prev_gauge_width = 0u32;
     // 顔の状態と、セッション仕切り直しの予約フラグ
     let mut face = FaceState::Idle;
     let mut new_session = false;
-    let mut response_playing = false;
+    // TLS接続の使い回しスロット(talkが管理)
+    let mut http_conn: Option<EspHttpConnection> = None;
+    // 顔アニメーション: 現在フレームと最終切替時刻
+    let mut face_frame: usize = 0;
+    let mut last_anim = std::time::Instant::now();
     // 再生キュー。Some((データ, 送信済みバイト数))=再生中、None=停止中。
     // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
     let mut playback: Option<(Vec<u8>, usize)> = None;
@@ -539,19 +726,60 @@ fn main() {
             0.0
         };
 
-        // --- RMSをdBに変換してレベルメーター描画(-60dB..0dB → 0..320px) ---
-        let db = 20.0 * (rms.max(1.0) / 32768.0).log10(); // -90dB〜0dB
-        let bar_width = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 320.0) as u32;
-        if bar_width != prev_bar_width {
-            meter_area
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-                .draw(&mut display)
-                .expect("メーター背景の描画に失敗");
-            Rectangle::new(Point::new(0, METER_Y), Size::new(bar_width, 20))
+        // --- 録音ホールド中のみ: 下部ステータスバーを横型音量ゲージとして使う ---
+        // VUメーター風の平滑化(上がりは即・下がりは1周8pxずつ)+差分描画でチラつき防止
+        if recording.is_some() {
+            let db = 20.0 * (rms.max(1.0) / 32768.0).log10(); // -90dB〜0dB
+            let target_w = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 320.0) as u32;
+            let gauge_w = if target_w > prev_gauge_width {
+                target_w
+            } else {
+                prev_gauge_width.saturating_sub(8).max(target_w)
+            };
+            if gauge_w > prev_gauge_width {
+                // 伸びた分だけ緑を足す
+                Rectangle::new(
+                    Point::new(prev_gauge_width as i32, STATUS_Y),
+                    Size::new(gauge_w - prev_gauge_width, STATUS_H),
+                )
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
                 .draw(&mut display)
-                .expect("メーターの描画に失敗");
-            prev_bar_width = bar_width;
+                .expect("ゲージの描画に失敗");
+            } else if gauge_w < prev_gauge_width {
+                // 縮んだ分だけ黒で消す
+                Rectangle::new(
+                    Point::new(gauge_w as i32, STATUS_Y),
+                    Size::new(prev_gauge_width - gauge_w, STATUS_H),
+                )
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                .draw(&mut display)
+                .expect("ゲージの描画に失敗");
+            }
+            prev_gauge_width = gauge_w;
+        }
+
+        // --- 顔アニメーション(待機=まばたき / 話し中=口パク) ---
+        // スプライト無効時はアニメーション不要(文字は静止)
+        match if FACE_SPRITES_ENABLED { face } else { FaceState::Thinking } {
+            FaceState::Idle => {
+                if face_frame == 0 && last_anim.elapsed().as_millis() > 3500 {
+                    face_frame = 1; // まばたき(目を閉じる)
+                    draw_face(&mut display, character, face, face_frame);
+                    last_anim = std::time::Instant::now();
+                } else if face_frame != 0 && last_anim.elapsed().as_millis() > 150 {
+                    face_frame = 0;
+                    draw_face(&mut display, character, face, face_frame);
+                    last_anim = std::time::Instant::now();
+                }
+            }
+            FaceState::Speaking => {
+                if last_anim.elapsed().as_millis() > 250 {
+                    face_frame = (face_frame + 1) % 3; // 口パクループ
+                    draw_face(&mut display, character, face, face_frame);
+                    last_anim = std::time::Instant::now();
+                }
+            }
+            _ => {} // 聞き耳・考え中は静止
         }
 
         // --- タッチ処理: タブ切替 / 顔エリア=プッシュ・トゥ・トーク / 新規ボタン ---
@@ -562,7 +790,7 @@ fn main() {
         let tx = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
         let ty = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
 
-        // 押した瞬間の処理(録音中・再生中は新規操作を受け付けない)
+        // 押した瞬間の処理(応答再生の割り込みはtalk()内で処理される)
         if touched_now && !was_touched && recording.is_none() && playback.is_none() {
             if ty < TAB_H as i32 {
                 // モードタブ
@@ -579,14 +807,31 @@ fn main() {
                 new_session = true;
                 log::info!("新規セッション予約");
                 draw_status(&mut display, text_style, &jp_font, "New session: next talk", Rgb565::BLUE);
-            } else if ty >= FACE_Y && ty < METER_Y {
+            } else if ty >= STATUS_Y && tx < CHAR_BTN_W {
+                // 「顔」ボタン: キャラ切替(チャイム+NVS保存)
+                character = (character + 1) % CHAR_COUNT;
+                if let Err(e) = app_nvs.set_u8("chara", character as u8) {
+                    log::warn!("キャラ選択のNVS保存に失敗: {e}");
+                }
+                log::info!("キャラ切替: {character}");
+                playback = Some((chime.clone(), 0));
+                draw_face(&mut display, character, face, face_frame);
+                draw_status(&mut display, text_style, &jp_font, "Character switched!", Rgb565::BLUE);
+            } else if ty >= FACE_Y && ty < STATUS_Y {
                 // 顔エリア: プッシュ・トゥ・トーク開始
                 log::info!("タッチ検出 → 録音開始(離すまで最大15秒)");
                 playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
                 recording = Some(Vec::with_capacity(MAX_RECORD_BYTES));
+                // ゲージ領域を一度だけ黒でクリア(以降は差分描画)
+                Rectangle::new(Point::new(0, STATUS_Y), Size::new(320, STATUS_H))
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                    .draw(&mut display)
+                    .expect("ゲージ背景の描画に失敗");
+                prev_gauge_width = 0;
                 face = FaceState::Listening;
-                draw_face(&mut display, &jp_font, face);
-                draw_status(&mut display, text_style, &jp_font, "REC... release to send", Rgb565::RED);
+                face_frame = 0;
+                last_anim = std::time::Instant::now();
+                draw_face(&mut display, character, face, face_frame);
             }
         }
 
@@ -597,11 +842,18 @@ fn main() {
             if pcm.len() >= MAX_RECORD_BYTES || (released && pcm.len() >= MIN_RECORD_BYTES) {
                 finished = recording.take();
             } else if released {
-                log::info!("録音が短すぎるためキャンセル({}バイト)", pcm.len());
+                // 短いタップ(0.5秒未満)は録音キャンセル。400ms以内に2回=ダブルタップで
+                // キャラ切替(短タップは未割り当て入力なのでプッシュ・トゥ・トークと衝突しない)
                 recording = None;
                 face = FaceState::Idle;
-                draw_face(&mut display, &jp_font, face);
-                draw_status(&mut display, text_style, &jp_font, "Too short - canceled", Rgb565::BLUE);
+                face_frame = 0;
+                last_anim = std::time::Instant::now();
+                // 短いタップ(0.5秒未満)は録音キャンセル扱い
+                // ※当初ダブルタップでのキャラ切替を試したが、「顔に触れる=録音開始」と
+                //   ジェスチャーが本質的に衝突するため専用の「顔」ボタン方式に変更した
+                log::info!("短タップ(録音キャンセル)");
+                draw_face(&mut display, character, face, face_frame);
+                draw_status(&mut display, text_style, &jp_font, "", Rgb565::BLUE);
             }
         }
         was_touched = touched_now;
@@ -620,12 +872,6 @@ fn main() {
             }
             if *pos >= data.len() {
                 playback = None;
-                // 応答の再生が終わったら顔を待機に戻す
-                if response_playing {
-                    response_playing = false;
-                    face = FaceState::Idle;
-                    draw_face(&mut display, &jp_font, face);
-                }
             }
         }
 
@@ -633,43 +879,57 @@ fn main() {
         if let Some(pcm) = finished {
             log::info!("録音完了({}バイト)。送信開始: {}", pcm.len(), CONFIG.server_url);
             face = FaceState::Thinking;
-            draw_face(&mut display, &jp_font, face);
+            face_frame = 0;
+                last_anim = std::time::Instant::now();
+                draw_face(&mut display, character, face, face_frame);
             draw_status(&mut display, text_style, &jp_font, "Sending...", Rgb565::BLUE);
 
+            // 話し中表示に切り替えてからストリーミング往復(受信しながら再生)
+            face = FaceState::Speaking;
+            face_frame = 0;
+            last_anim = std::time::Instant::now();
+            draw_face(&mut display, character, face, face_frame);
+
             let started = std::time::Instant::now();
-            let result = talk(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ, mode, new_session);
+            let result = talk(
+                CONFIG.server_url,
+                &pcm,
+                SAMPLE_RATE_HZ,
+                mode,
+                new_session,
+                character,
+                &mut i2s,
+                &mut i2c,
+                &mut display,
+                &mut http_conn,
+            );
             let elapsed_ms = started.elapsed().as_millis();
             let msg = match result {
-                Ok((200, timing, body)) => {
-                    log::info!("応答受信: {}バイト / Worker内訳: {timing}", body.len());
-                    // モノラル16kHz PCM → ステレオに複製して再生キューへ。
-                    // 末尾無音(I2S DMA繰り返し対策)はWorker側で付加済み。
-                    // ※当初デバイス側で無音を付けていたが、その定数計算がesp版rustcの
-                    //   コンパイラバグ(LLVM ICE→回避後もミスコンパイル)を踏んだため
-                    //   Worker側に移した。troubleshooting.md参照
-                    let mut stereo = Vec::with_capacity(body.len() * 2);
-                    for s in body.chunks_exact(2) {
-                        stereo.extend_from_slice(s);
-                        stereo.extend_from_slice(s);
-                    }
-                    playback = Some((stereo, 0));
+                Ok((200, interrupted)) => {
                     new_session = false; // 仕切り直しが伝わったのでフラグを下ろす
-                    response_playing = true;
-                    face = FaceState::Speaking;
-                    format!("OK {elapsed_ms}ms (dev) / {timing}")
+                    log::info!("往復完了 {elapsed_ms}ms (割り込み={interrupted})");
+                    String::new() // 計測情報はシリアルログのみ(画面はすっきり保つ)
                 }
-                Ok((status, _, _)) => {
-                    face = FaceState::Idle;
-                    format!("Relay error: {status} ({elapsed_ms}ms)")
-                }
+                Ok((status, _)) => format!("Relay error: {status}"),
                 Err(e) => {
                     log::error!("送信失敗: {e}");
-                    face = FaceState::Idle;
                     format!("Send FAILED ({elapsed_ms}ms)")
                 }
             };
-            log::info!("往復結果: {msg}");
-            draw_face(&mut display, &jp_font, face);
+            // 再生中にマイクバッファへ溜まった音(自分の声・スピーカー音)を捨てる。
+            // 捨てないと次の録音の先頭に混入する
+            loop {
+                match i2s.read(&mut audio_buf, 0) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_TIMEOUT => break,
+                    Err(e) => panic!("I2S読み取りに失敗: {e}"),
+                }
+            }
+            face = FaceState::Idle;
+            face_frame = 0;
+            last_anim = std::time::Instant::now();
+            draw_face(&mut display, character, face, face_frame);
             draw_status(&mut display, text_style, &jp_font, &msg, Rgb565::BLUE);
         }
     }
