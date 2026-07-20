@@ -44,6 +44,7 @@ const AXP2101_ADDR: u8 = 0x34; // 電源管理IC
 const AW9523_ADDR: u8 = 0x58; // IOエキスパンダ
 const FT6336_ADDR: u8 = 0x38; // 静電タッチコントローラ
 const ES7210_ADDR: u8 = 0x40; // マイクADC(デュアルマイク)
+const AW88298_ADDR: u8 = 0x36; // スピーカーアンプ
 
 const SAMPLE_RATE_HZ: u32 = 16000; // 音声認識用途の定番レート
 
@@ -244,22 +245,56 @@ fn main() {
         .expect("ES7210のクロック設定に失敗"); // 必要なクロックのみ残して確定
     log::info!("ES7210初期化完了");
 
-    // ---- 9. I2S受信(BCLK=GPIO34, WS=GPIO33, DIN=GPIO14, MCLK=GPIO0) ----
-    // ESP32-S3がI2Sマスター、ES7210はスレーブ。16kHz/16bit/ステレオ(マイク1=左, マイク2=右)
+    // ---- 9. AW88298(スピーカーアンプ)をI2Cで初期化 ----
+    // レジスタは16bit幅・ビッグエンディアンで書く。値はM5Unifiedの実績値。
+    // AW88298のリセット/イネーブルはAW9523のP0_2(初期化済み)
+    let aw88298_init: [(u8, u16); 5] = [
+        (0x61, 0x0673), // ブーストモード無効
+        (0x04, 0x4040), // I2S有効・アンプON
+        (0x05, 0x0008), // ミュート解除
+        (0x06, 0x14C3), // I2S設定+サンプルレート: (16000+1102)/2205=7 → テーブルidx3 | 0x14C0
+        (0x0C, 0x0064), // 音量
+    ];
+    for (reg, val) in aw88298_init {
+        let [hi, lo] = val.to_be_bytes();
+        i2c.write(AW88298_ADDR, &[reg, hi, lo], BLOCK)
+            .expect("AW88298への書き込みに失敗");
+    }
+    log::info!("AW88298初期化完了");
+
+    // ---- 10. I2S双方向(BCLK=GPIO34, WS=GPIO33, DIN=GPIO14, DOUT=GPIO13, MCLK=GPIO0) ----
+    // マイク(ES7210)とスピーカー(AW88298)は同じI2Sバスを共有している。
+    // ESP32-S3がマスター、16kHz/16bit/ステレオ(マイク1=左, マイク2=右)
     let i2s_config = StdConfig::philips(SAMPLE_RATE_HZ, DataBitWidth::Bits16);
-    let mut i2s = I2sDriver::new_std_rx(
+    let mut i2s = I2sDriver::new_std_bidir(
         peripherals.i2s1,
         &i2s_config,
         peripherals.pins.gpio34,
         peripherals.pins.gpio14,
+        peripherals.pins.gpio13,
         Some(peripherals.pins.gpio0),
         peripherals.pins.gpio33,
     )
     .expect("I2Sドライバの初期化に失敗");
     i2s.rx_enable().expect("I2S受信の開始に失敗");
-    log::info!("I2S受信開始");
+    i2s.tx_enable().expect("I2S送信の開始に失敗");
+    log::info!("I2S送受信開始");
 
-    // ---- 10. メインループ: 音量レベルメーター + タッチで白丸 ----
+    // タッチ時に鳴らすビープ音(1kHzサイン波・150ms)をあらかじめ生成しておく
+    let beep: Vec<u8> = {
+        let frames = (SAMPLE_RATE_HZ as usize) * 150 / 1000;
+        let mut buf = Vec::with_capacity(frames * 4);
+        for n in 0..frames {
+            let t = n as f32 / SAMPLE_RATE_HZ as f32;
+            let sample = ((t * 1000.0 * 2.0 * core::f32::consts::PI).sin() * 8000.0) as i16;
+            let bytes = sample.to_le_bytes();
+            buf.extend_from_slice(&bytes); // 左ch
+            buf.extend_from_slice(&bytes); // 右ch
+        }
+        buf
+    };
+
+    // ---- 11. メインループ: 音量レベルメーター + タッチで白丸&ビープ ----
     // 512フレーム(ステレオ16bit=2048バイト)ずつ読む。16kHzなので1回あたり32ms
     let mut audio_buf = [0u8; 2048];
     let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
@@ -306,8 +341,15 @@ fn main() {
             let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
             let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
             if !was_touched {
-                log::info!("タッチ検出: x={x}, y={y}");
+                log::info!("タッチ検出: x={x}, y={y} → ビープ再生");
                 was_touched = true;
+                // タッチした瞬間にビープを鳴らす(書き込みは全バイト送るまでループ)
+                let mut written = 0;
+                while written < beep.len() {
+                    written += i2s
+                        .write(&beep[written..], BLOCK)
+                        .expect("I2S書き込みに失敗");
+                }
             }
             Circle::with_center(Point::new(x, y), 12)
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
