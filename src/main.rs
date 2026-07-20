@@ -9,6 +9,10 @@ use esp_idf_hal::{
     delay::{Delay, FreeRtos, BLOCK},
     gpio::{AnyIOPin, PinDriver},
     i2c::{I2cConfig, I2cDriver},
+    i2s::{
+        config::{DataBitWidth, StdConfig},
+        I2sDriver,
+    },
     peripherals::Peripherals,
     spi::{config::Config as SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig},
     units::FromValueType,
@@ -39,6 +43,9 @@ pub struct Config {
 const AXP2101_ADDR: u8 = 0x34; // 電源管理IC
 const AW9523_ADDR: u8 = 0x58; // IOエキスパンダ
 const FT6336_ADDR: u8 = 0x38; // 静電タッチコントローラ
+const ES7210_ADDR: u8 = 0x40; // マイクADC(デュアルマイク)
+
+const SAMPLE_RATE_HZ: u32 = 16000; // 音声認識用途の定番レート
 
 fn main() {
     // It is necessary to call this function once. Otherwise, some patches to the runtime
@@ -199,17 +206,103 @@ fn main() {
         .draw(&mut display)
         .expect("テキスト描画に失敗");
 
-    // ---- 8. タッチ(FT6336)をポーリングして、触った場所に白丸を描く ----
-    // FT6336のリセット線はAW9523のP0_0。上の初期化でHighにしているので既に動いている
+    // ---- 8. ES7210(マイクADC)をI2Cで初期化 ----
+    // レジスタ値はM5Unifiedの実績値。マイク1/2(前面デュアルマイク)を有効化し、
+    // 16bit I2Sスレーブとして動かす。マイク3/4は未接続なのでパワーダウン
+    let es7210_init: [(u8, u8); 25] = [
+        (0x00, 0xFF), // リセット
+        (0x00, 0x41), // リセット解除
+        (0x01, 0x1F), // クロック一旦全ON
+        (0x06, 0x00), // デジタル電源ON
+        (0x07, 0x20), // ADCオーバーサンプリング設定
+        (0x08, 0x10), // 動作モード
+        (0x09, 0x30), // チャージポンプ設定0
+        (0x0A, 0x30), // チャージポンプ設定1
+        (0x20, 0x0A), // ADC34ハイパスフィルタ2
+        (0x21, 0x2A), // ADC34ハイパスフィルタ1
+        (0x22, 0x0A), // ADC12ハイパスフィルタ2
+        (0x23, 0x2A), // ADC12ハイパスフィルタ1
+        (0x02, 0xC1), // クロックマネージャ(MCLK分周設定)
+        (0x04, 0x01), // ADC制御
+        (0x05, 0x00), // ADC制御
+        (0x11, 0x60), // シリアルポート: 16bit I2Sフォーマット
+        (0x40, 0x42), // アナログ系電源ON
+        (0x41, 0x70), // マイクバイアス1/2
+        (0x42, 0x70), // マイクバイアス3/4
+        (0x43, 0x1B), // マイク1ゲイン
+        (0x44, 0x1B), // マイク2ゲイン
+        (0x45, 0x00), // マイク3ゲイン(未使用)
+        (0x46, 0x00), // マイク4ゲイン(未使用)
+        (0x4B, 0x00), // マイク1/2電源ON
+        (0x4C, 0xFF), // マイク3/4パワーダウン
+    ];
+    for (reg, val) in es7210_init {
+        i2c.write(ES7210_ADDR, &[reg, val], BLOCK)
+            .expect("ES7210への書き込みに失敗");
+    }
+    i2c.write(ES7210_ADDR, &[0x01, 0x14], BLOCK)
+        .expect("ES7210のクロック設定に失敗"); // 必要なクロックのみ残して確定
+    log::info!("ES7210初期化完了");
+
+    // ---- 9. I2S受信(BCLK=GPIO34, WS=GPIO33, DIN=GPIO14, MCLK=GPIO0) ----
+    // ESP32-S3がI2Sマスター、ES7210はスレーブ。16kHz/16bit/ステレオ(マイク1=左, マイク2=右)
+    let i2s_config = StdConfig::philips(SAMPLE_RATE_HZ, DataBitWidth::Bits16);
+    let mut i2s = I2sDriver::new_std_rx(
+        peripherals.i2s1,
+        &i2s_config,
+        peripherals.pins.gpio34,
+        peripherals.pins.gpio14,
+        Some(peripherals.pins.gpio0),
+        peripherals.pins.gpio33,
+    )
+    .expect("I2Sドライバの初期化に失敗");
+    i2s.rx_enable().expect("I2S受信の開始に失敗");
+    log::info!("I2S受信開始");
+
+    // ---- 10. メインループ: 音量レベルメーター + タッチで白丸 ----
+    // 512フレーム(ステレオ16bit=2048バイト)ずつ読む。16kHzなので1回あたり32ms
+    let mut audio_buf = [0u8; 2048];
+    let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
     let mut was_touched = false;
+    let mut prev_bar_width = 0u32;
     loop {
-        // レジスタ0x02(タッチ点数)から5バイト連続読み: 点数, X上位, X下位, Y上位, Y下位
+        // --- 録音データを読んでRMS音量を計算 ---
+        let n = i2s.read(&mut audio_buf, BLOCK).expect("I2S読み取りに失敗");
+        let mut sum_sq: i64 = 0;
+        let mut count: i64 = 0;
+        // ステレオのうち左チャネル(マイク1)だけ使う: 4バイト周期の先頭2バイト
+        for frame in audio_buf[..n].chunks_exact(4) {
+            let sample = i16::from_le_bytes([frame[0], frame[1]]) as i64;
+            sum_sq += sample * sample;
+            count += 1;
+        }
+        let rms = if count > 0 {
+            ((sum_sq / count) as f32).sqrt()
+        } else {
+            0.0
+        };
+
+        // --- RMSをdBに変換してレベルメーター描画(-60dB..0dB → 0..320px) ---
+        let db = 20.0 * (rms.max(1.0) / 32768.0).log10(); // -90dB〜0dB
+        let bar_width = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 320.0) as u32;
+        if bar_width != prev_bar_width {
+            meter_area
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                .draw(&mut display)
+                .expect("メーター背景の描画に失敗");
+            Rectangle::new(Point::new(0, 180), Size::new(bar_width, 20))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
+                .draw(&mut display)
+                .expect("メーターの描画に失敗");
+            prev_bar_width = bar_width;
+        }
+
+        // --- タッチ位置に白丸(座標系検証の名残。録音と共存できることの確認も兼ねる) ---
         let mut buf = [0u8; 5];
         i2c.write_read(FT6336_ADDR, &[0x02], &mut buf, BLOCK)
             .expect("FT6336の読み取りに失敗");
         let touches = buf[0] & 0x0F;
         if touches > 0 {
-            // 座標は12bit。上位バイトは下位4bitのみ有効(上位2bitはイベントフラグ)
             let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
             let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
             if !was_touched {
@@ -223,6 +316,5 @@ fn main() {
         } else {
             was_touched = false;
         }
-        FreeRtos::delay_ms(20);
     }
 }
