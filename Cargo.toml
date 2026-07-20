@@ -15,9 +15,9 @@ opt-level = "s"
 
 [profile.dev]
 debug = true    # Symbols are nice, and they don't increase the size on Flash
-# "z"はesp版rustc(Xtensaバックエンド)のコンパイラバグを踏んだため"s"に変更
-# (LLVM ICE「Cannot select: Constant<19200>」および起動時クラッシュ。troubleshooting.md参照)
-opt-level = "s"
+# 注: Xtensa Rust 1.95.0.0 では "z" がLLVM ICE+ミスコンパイルを起こした。
+# 1.97.0.0 への更新で解消を確認してテンプレート既定の "z" に戻した(troubleshooting.md参照)
+opt-level = "z"
 [patch.crates-io]
 esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
 esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }

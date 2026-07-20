@@ -2,7 +2,7 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_10X20, MonoTextStyle},
     pixelcolor::Rgb565,
     prelude::*,
-    primitives::{Circle, PrimitiveStyle, Rectangle},
+    primitives::{PrimitiveStyle, Rectangle},
     text::Text,
 };
 use esp_idf_hal::{
@@ -342,12 +342,13 @@ fn main() {
     i2s.tx_enable().expect("I2S送信の開始に失敗");
     log::info!("I2S送受信開始");
 
-    // タッチ時に鳴らすビープ音(1kHzサイン波・150ms)をあらかじめ生成しておく。
-    // 末尾に300msの無音を付ける: I2S送信DMAはデータが尽きると最後のバッファを
+    // タッチ時に鳴らすビープ音(1kHzサイン波・80ms)をあらかじめ生成しておく。
+    // 短いのは、押してすぐ話し始められるように(ビープ再生中は録音しないため)。
+    // 末尾に150msの無音を付ける: I2S送信DMAはデータが尽きると最後のバッファを
     // 繰り返し再生するため、無音で終わらせないとビープが鳴りっぱなしになる
     let beep: Vec<u8> = {
-        let tone_frames = (SAMPLE_RATE_HZ as usize) * 150 / 1000;
-        let silence_frames = (SAMPLE_RATE_HZ as usize) * 300 / 1000;
+        let tone_frames = (SAMPLE_RATE_HZ as usize) * 80 / 1000;
+        let silence_frames = (SAMPLE_RATE_HZ as usize) * 150 / 1000;
         let mut buf = Vec::with_capacity((tone_frames + silence_frames) * 4);
         for n in 0..(tone_frames + silence_frames) {
             let sample = if n < tone_frames {
@@ -363,7 +364,7 @@ fn main() {
         buf
     };
 
-    // ---- 11. メインループ: 音量レベルメーター + タッチで白丸&ビープ ----
+    // ---- 11. メインループ: 音量レベルメーター + プッシュ・トゥ・トーク ----
     // 512フレーム(ステレオ16bit=2048バイト)ずつ読む。16kHzなので1回あたり32ms
     let mut audio_buf = [0u8; 2048];
     let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
@@ -372,8 +373,10 @@ fn main() {
     // 再生キュー。Some((データ, 送信済みバイト数))=再生中、None=停止中。
     // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
     let mut playback: Option<(Vec<u8>, usize)> = None;
-    // 録音バッファ。Some=録音中(モノラル16bit PCMを蓄積)、None=待機中
-    const RECORD_BYTES: usize = (SAMPLE_RATE_HZ as usize) * 2 * 3; // 3秒ぶん
+    // 録音バッファ。Some=録音中(モノラル16bit PCMを蓄積)、None=待機中。
+    // プッシュ・トゥ・トーク: タッチしている間だけ録音し、離したら送信
+    const MAX_RECORD_BYTES: usize = (SAMPLE_RATE_HZ as usize) * 2 * 15; // 上限15秒(安全弁)
+    const MIN_RECORD_BYTES: usize = (SAMPLE_RATE_HZ as usize) * 2 / 2; // 0.5秒未満はキャンセル
     let mut recording: Option<Vec<u8>> = None;
     loop {
         // --- 録音データを読んでRMS音量を計算 ---
@@ -388,7 +391,7 @@ fn main() {
             // 録音中(かつビープ再生が終わってから)はモノラルPCMとして蓄積
             if playback.is_none() {
                 if let Some(pcm) = recording.as_mut() {
-                    if pcm.len() < RECORD_BYTES {
+                    if pcm.len() < MAX_RECORD_BYTES {
                         pcm.extend_from_slice(&frame[..2]);
                     }
                 }
@@ -415,52 +418,65 @@ fn main() {
             prev_bar_width = bar_width;
         }
 
-        // --- タッチ位置に白丸(座標系検証の名残。録音と共存できることの確認も兼ねる) ---
-        let mut buf = [0u8; 5];
+        // --- プッシュ・トゥ・トーク: 押している間だけ録音、離したら送信 ---
+        let mut buf = [0u8; 1];
         i2c.write_read(FT6336_ADDR, &[0x02], &mut buf, BLOCK)
             .expect("FT6336の読み取りに失敗");
-        let touches = buf[0] & 0x0F;
-        if touches > 0 {
-            let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
-            let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
-            if !was_touched {
-                was_touched = true;
-                // 録音中でも応答再生中でもなければ、ビープ→3秒録音を開始
-                if recording.is_none() && playback.is_none() {
-                    log::info!("タッチ検出: x={x}, y={y} → ビープ後3秒録音");
-                    playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
-                    recording = Some(Vec::with_capacity(RECORD_BYTES));
-                    Rectangle::new(Point::new(0, 205), Size::new(320, 35))
-                        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-                        .draw(&mut display)
-                        .expect("描画に失敗");
-                    Text::new("REC...", Point::new(10, 225), text_style)
-                        .draw(&mut display)
-                        .expect("テキスト描画に失敗");
-                }
-            }
-            Circle::with_center(Point::new(x, y), 12)
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
+        let touched_now = (buf[0] & 0x0F) > 0;
+
+        // 押した瞬間: ビープ→録音開始(応答再生中は無視)
+        if touched_now && !was_touched && recording.is_none() && playback.is_none() {
+            log::info!("タッチ検出 → 録音開始(離すまで最大15秒)");
+            playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
+            recording = Some(Vec::with_capacity(MAX_RECORD_BYTES));
+            Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
                 .draw(&mut display)
-                .expect("丸の描画に失敗");
-        } else {
-            was_touched = false;
+                .expect("描画に失敗");
+            Text::new("REC... release to send", Point::new(10, 225), text_style)
+                .draw(&mut display)
+                .expect("テキスト描画に失敗");
         }
+
+        // 離した瞬間 or 上限到達で録音終了。短すぎる場合はキャンセル
+        let released = was_touched && !touched_now;
+        let mut finished: Option<Vec<u8>> = None;
+        if let Some(pcm) = recording.as_ref() {
+            if pcm.len() >= MAX_RECORD_BYTES || (released && pcm.len() >= MIN_RECORD_BYTES) {
+                finished = recording.take();
+            } else if released {
+                log::info!("録音が短すぎるためキャンセル({}バイト)", pcm.len());
+                recording = None;
+                Rectangle::new(Point::new(0, 205), Size::new(320, 35))
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+                    .draw(&mut display)
+                    .expect("描画に失敗");
+                Text::new("Too short - canceled", Point::new(10, 225), text_style)
+                    .draw(&mut display)
+                    .expect("テキスト描画に失敗");
+            }
+        }
+        was_touched = touched_now;
 
         // --- 再生キューに残りがあれば続きを書く(タイムアウト0=書ける分だけ書いてすぐ戻る) ---
         // ループは録音読み(32ms)でペーシングされており、毎周32ms分以上の
         // 送信バッファ空きができるので、これで途切れず再生される
         if let Some((data, pos)) = playback.as_mut() {
-            let written = i2s.write(&data[*pos..], 0).expect("I2S書き込みに失敗");
-            *pos += written;
+            // タイムアウト0のwriteはDMAバッファに全く空きがないとESP_ERR_TIMEOUTを返すが、
+            // これはエラーではなく「今回は書けなかった」の意味(次の周回で再試行すればよい)。
+            // expectで落とすとタイミング次第でパニック再起動する(troubleshooting.md参照)
+            match i2s.write(&data[*pos..], 0) {
+                Ok(written) => *pos += written,
+                Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_TIMEOUT => {}
+                Err(e) => panic!("I2S書き込みに失敗: {e}"),
+            }
             if *pos >= data.len() {
                 playback = None;
             }
         }
 
-        // --- 3秒ぶん録音が溜まったらWAV化してMacへPOST ---
-        if recording.as_ref().is_some_and(|pcm| pcm.len() >= RECORD_BYTES) {
-            let pcm = recording.take().unwrap();
+        // --- 録音が確定したらWAV化して中継WorkerへPOST ---
+        if let Some(pcm) = finished {
             log::info!("録音完了({}バイト)。送信開始: {}", pcm.len(), CONFIG.server_url);
             Rectangle::new(Point::new(0, 205), Size::new(320, 35))
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
