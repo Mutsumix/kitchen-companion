@@ -62,11 +62,21 @@ fn wav_header(pcm_len: u32, sample_rate: u32) -> [u8; 44] {
     h
 }
 
-/// PCMをWAVとしてHTTP POSTしてステータスコードを返す。
-/// ヘッダと本体を別々に書き込み、結合バッファを作らない(メモリ節約)
-fn post_wav(url: &str, pcm: &[u8], sample_rate: u32) -> Result<u16, esp_idf_svc::sys::EspError> {
+/// 録音PCMをWAVとして中継WorkerにPOSTし、(ステータス, タイミング情報, 応答音声PCM)を返す。
+/// WAVヘッダと本体は別々に書き込み、結合バッファを作らない(メモリ節約)
+fn talk(
+    url: &str,
+    pcm: &[u8],
+    sample_rate: u32,
+) -> Result<(u16, String, Vec<u8>), esp_idf_svc::sys::EspError> {
     let header = wav_header(pcm.len() as u32, sample_rate);
-    let mut conn = EspHttpConnection::new(&HttpConfig::default())?;
+    let mut conn = EspHttpConnection::new(&HttpConfig {
+        // HTTPSに必要なルート証明書バンドル(ESP-IDF組み込み)
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        // STT→LLM→TTSで6秒超かかるため、デフォルトの数秒では足りない
+        timeout: Some(core::time::Duration::from_secs(30)),
+        ..Default::default()
+    })?;
     let len = (header.len() + pcm.len()).to_string();
     conn.initiate_request(
         Method::Post,
@@ -76,7 +86,19 @@ fn post_wav(url: &str, pcm: &[u8], sample_rate: u32) -> Result<u16, esp_idf_svc:
     conn.write_all(&header)?;
     conn.write_all(pcm)?;
     conn.initiate_response()?;
-    Ok(conn.status())
+    let status = conn.status();
+    let timing = conn.header("X-Timing").unwrap_or_default().to_string();
+    // 応答ボディ(16kHzモノラルPCM)を読み切る。TTS音声は数百KBになるためPSRAM頼み
+    let mut body = Vec::with_capacity(256 * 1024);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = conn.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok((status, timing, body))
 }
 
 // CoreS3 内蔵I2Cバス上のデバイスアドレス
@@ -347,9 +369,9 @@ fn main() {
     let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
     let mut was_touched = false;
     let mut prev_bar_width = 0u32;
-    // ビープの再生位置。Some(n)=再生中(nバイト目まで送信済み)、None=停止中。
+    // 再生キュー。Some((データ, 送信済みバイト数))=再生中、None=停止中。
     // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
-    let mut beep_pos: Option<usize> = None;
+    let mut playback: Option<(Vec<u8>, usize)> = None;
     // 録音バッファ。Some=録音中(モノラル16bit PCMを蓄積)、None=待機中
     const RECORD_BYTES: usize = (SAMPLE_RATE_HZ as usize) * 2 * 3; // 3秒ぶん
     let mut recording: Option<Vec<u8>> = None;
@@ -364,7 +386,7 @@ fn main() {
             sum_sq += sample * sample;
             count += 1;
             // 録音中(かつビープ再生が終わってから)はモノラルPCMとして蓄積
-            if beep_pos.is_none() {
+            if playback.is_none() {
                 if let Some(pcm) = recording.as_mut() {
                     if pcm.len() < RECORD_BYTES {
                         pcm.extend_from_slice(&frame[..2]);
@@ -403,10 +425,10 @@ fn main() {
             let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
             if !was_touched {
                 was_touched = true;
-                // 録音中でなければ、ビープ→3秒録音を開始
-                if recording.is_none() {
+                // 録音中でも応答再生中でもなければ、ビープ→3秒録音を開始
+                if recording.is_none() && playback.is_none() {
                     log::info!("タッチ検出: x={x}, y={y} → ビープ後3秒録音");
-                    beep_pos = Some(0); // 実際の送信はループ末尾で小分けに行う
+                    playback = Some((beep.clone(), 0)); // 実際の送信はループ末尾で小分けに行う
                     recording = Some(Vec::with_capacity(RECORD_BYTES));
                     Rectangle::new(Point::new(0, 205), Size::new(320, 35))
                         .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
@@ -425,13 +447,15 @@ fn main() {
             was_touched = false;
         }
 
-        // --- ビープ再生中なら続きを書く(タイムアウト0=書ける分だけ書いてすぐ戻る) ---
+        // --- 再生キューに残りがあれば続きを書く(タイムアウト0=書ける分だけ書いてすぐ戻る) ---
         // ループは録音読み(32ms)でペーシングされており、毎周32ms分以上の
         // 送信バッファ空きができるので、これで途切れず再生される
-        if let Some(pos) = beep_pos {
-            let written = i2s.write(&beep[pos..], 0).expect("I2S書き込みに失敗");
-            let next = pos + written;
-            beep_pos = if next >= beep.len() { None } else { Some(next) };
+        if let Some((data, pos)) = playback.as_mut() {
+            let written = i2s.write(&data[*pos..], 0).expect("I2S書き込みに失敗");
+            *pos += written;
+            if *pos >= data.len() {
+                playback = None;
+            }
         }
 
         // --- 3秒ぶん録音が溜まったらWAV化してMacへPOST ---
@@ -447,16 +471,31 @@ fn main() {
                 .expect("テキスト描画に失敗");
 
             let started = std::time::Instant::now();
-            let result = post_wav(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ);
+            let result = talk(CONFIG.server_url, &pcm, SAMPLE_RATE_HZ);
             let elapsed_ms = started.elapsed().as_millis();
             let msg = match result {
-                Ok(status) => format!("Sent: {status} ({elapsed_ms}ms)"),
+                Ok((200, timing, body)) => {
+                    log::info!("応答受信: {}バイト / Worker内訳: {timing}", body.len());
+                    // モノラル16kHz PCM → ステレオに複製して再生キューへ。
+                    // 末尾無音(I2S DMA繰り返し対策)はWorker側で付加済み。
+                    // ※当初デバイス側で無音を付けていたが、その定数計算がesp版rustcの
+                    //   コンパイラバグ(LLVM ICE→回避後もミスコンパイル)を踏んだため
+                    //   Worker側に移した。troubleshooting.md参照
+                    let mut stereo = Vec::with_capacity(body.len() * 2);
+                    for s in body.chunks_exact(2) {
+                        stereo.extend_from_slice(s);
+                        stereo.extend_from_slice(s);
+                    }
+                    playback = Some((stereo, 0));
+                    format!("OK {elapsed_ms}ms (dev) / {timing}")
+                }
+                Ok((status, _, _)) => format!("Relay error: {status} ({elapsed_ms}ms)"),
                 Err(e) => {
                     log::error!("送信失敗: {e}");
                     format!("Send FAILED ({elapsed_ms}ms)")
                 }
             };
-            log::info!("送信結果: {msg}");
+            log::info!("往復結果: {msg}");
             Rectangle::new(Point::new(0, 205), Size::new(320, 35))
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
                 .draw(&mut display)

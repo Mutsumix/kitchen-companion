@@ -1,0 +1,6 @@
+name = "kitchen-companion-relay"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# APIキーはコードや設定ファイルに書かない。デプロイ後に以下で登録する:
+#   npx wrangler secret put OPENAI_API_KEY
