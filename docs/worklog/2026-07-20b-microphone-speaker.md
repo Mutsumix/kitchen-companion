@@ -44,6 +44,8 @@ grep -rn "new_std_rx" ~/.cargo/git/checkouts/esp-idf-hal-*/*/src/i2s/std.rs
 ## ハマりどころ
 
 - 書き込み時に「Error while connecting to device / No such file or directory」→ シリアルポート名が `/dev/cu.usbmodem1101` から `/dev/cu.usbmodem101` に変わっていた。USBの挿し直しや再列挙でポート名は変わるので、エラー時はまず `ls /dev/cu.*` で現在のポートを確認する
+- **ビープが鳴りっぱなしになる事故**: I2S送信DMAは最後のバッファを繰り返すため、150msで終わるはずの音が止まらなくなった。再生データ末尾に300msの無音を付けて解決。緊急停止は `espflash reset` が最速(詳細は troubleshooting.md)
+- **ビープ再生中にレベルメーターが凍る**: ブロッキング書き込みでループごと止まっていた。再生カーソル+タイムアウト0の非ブロッキング小分け書き込みに変更し、再生とメーター更新の並行動作を実機確認
 
 ## 計測値
 

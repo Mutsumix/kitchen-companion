@@ -280,13 +280,20 @@ fn main() {
     i2s.tx_enable().expect("I2S送信の開始に失敗");
     log::info!("I2S送受信開始");
 
-    // タッチ時に鳴らすビープ音(1kHzサイン波・150ms)をあらかじめ生成しておく
+    // タッチ時に鳴らすビープ音(1kHzサイン波・150ms)をあらかじめ生成しておく。
+    // 末尾に300msの無音を付ける: I2S送信DMAはデータが尽きると最後のバッファを
+    // 繰り返し再生するため、無音で終わらせないとビープが鳴りっぱなしになる
     let beep: Vec<u8> = {
-        let frames = (SAMPLE_RATE_HZ as usize) * 150 / 1000;
-        let mut buf = Vec::with_capacity(frames * 4);
-        for n in 0..frames {
-            let t = n as f32 / SAMPLE_RATE_HZ as f32;
-            let sample = ((t * 1000.0 * 2.0 * core::f32::consts::PI).sin() * 8000.0) as i16;
+        let tone_frames = (SAMPLE_RATE_HZ as usize) * 150 / 1000;
+        let silence_frames = (SAMPLE_RATE_HZ as usize) * 300 / 1000;
+        let mut buf = Vec::with_capacity((tone_frames + silence_frames) * 4);
+        for n in 0..(tone_frames + silence_frames) {
+            let sample = if n < tone_frames {
+                let t = n as f32 / SAMPLE_RATE_HZ as f32;
+                ((t * 1000.0 * 2.0 * core::f32::consts::PI).sin() * 8000.0) as i16
+            } else {
+                0
+            };
             let bytes = sample.to_le_bytes();
             buf.extend_from_slice(&bytes); // 左ch
             buf.extend_from_slice(&bytes); // 右ch
@@ -300,6 +307,9 @@ fn main() {
     let meter_area = Rectangle::new(Point::new(0, 180), Size::new(320, 20));
     let mut was_touched = false;
     let mut prev_bar_width = 0u32;
+    // ビープの再生位置。Some(n)=再生中(nバイト目まで送信済み)、None=停止中。
+    // ループを止めずに毎周「書けるぶんだけ」書く非ブロッキング方式
+    let mut beep_pos: Option<usize> = None;
     loop {
         // --- 録音データを読んでRMS音量を計算 ---
         let n = i2s.read(&mut audio_buf, BLOCK).expect("I2S読み取りに失敗");
@@ -341,15 +351,9 @@ fn main() {
             let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
             let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
             if !was_touched {
-                log::info!("タッチ検出: x={x}, y={y} → ビープ再生");
+                log::info!("タッチ検出: x={x}, y={y} → ビープ再生開始");
                 was_touched = true;
-                // タッチした瞬間にビープを鳴らす(書き込みは全バイト送るまでループ)
-                let mut written = 0;
-                while written < beep.len() {
-                    written += i2s
-                        .write(&beep[written..], BLOCK)
-                        .expect("I2S書き込みに失敗");
-                }
+                beep_pos = Some(0); // 実際の送信はループ末尾で小分けに行う
             }
             Circle::with_center(Point::new(x, y), 12)
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
@@ -357,6 +361,15 @@ fn main() {
                 .expect("丸の描画に失敗");
         } else {
             was_touched = false;
+        }
+
+        // --- ビープ再生中なら続きを書く(タイムアウト0=書ける分だけ書いてすぐ戻る) ---
+        // ループは録音読み(32ms)でペーシングされており、毎周32ms分以上の
+        // 送信バッファ空きができるので、これで途切れず再生される
+        if let Some(pos) = beep_pos {
+            let written = i2s.write(&beep[pos..], 0).expect("I2S書き込みに失敗");
+            let next = pos + written;
+            beep_pos = if next >= beep.len() { None } else { Some(next) };
         }
     }
 }
