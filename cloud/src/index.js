@@ -8,7 +8,12 @@
 const STT_MODEL = "gpt-4o-mini-transcribe";
 const LLM_MODEL = "gpt-4o-mini";
 const TTS_MODEL = "tts-1";
-const TTS_VOICE = "nova";
+const TTS_VOICE = "nova"; // 既定(X-Character未指定時)
+// キャラごとの声(デバイスの X-Character ヘッダで切替。変更はここを書き換えてdeployするだけ)
+const VOICE_BY_CHARACTER = {
+  robo: "alloy",
+  girl: "nova",
+};
 
 const COMMON_RULES = `あなたは台所に置かれた小さなAI料理相棒です。回答はすべて音声で読み上げられます。
 - 完全に自然な日本語の話し言葉だけで答える。箇条書き・番号(1. 2.)・記号・見出し・絵文字は絶対に使わない
@@ -69,105 +74,112 @@ async function openai(path, env, init) {
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
+      // 試聴用: GET /voice?name=shimmer&text=... で任意の声のWAVを返す(聞き比べ用)
+      const url = new URL(request.url);
+      if (url.pathname === "/voice") {
+        const voice = url.searchParams.get("name") ?? TTS_VOICE;
+        const text = url.searchParams.get("text") ?? "こんにちは。今夜は肉じゃがなんてどうかな。作り方も教えられるよ。";
+        const tts = await openai("audio/speech", env, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: TTS_MODEL, voice, input: text, response_format: "pcm" }),
+        });
+        const pcm = new Int16Array(await tts.arrayBuffer()); // 24kHzのまま返す(試聴用WAV)
+        const header = new DataView(new ArrayBuffer(44));
+        const bytes = pcm.byteLength;
+        const enc = new TextEncoder();
+        new Uint8Array(header.buffer, 0, 4).set(enc.encode("RIFF"));
+        header.setUint32(4, 36 + bytes, true);
+        new Uint8Array(header.buffer, 8, 8).set(enc.encode("WAVEfmt "));
+        header.setUint32(16, 16, true);
+        header.setUint16(20, 1, true);
+        header.setUint16(22, 1, true);
+        header.setUint32(24, 24000, true);
+        header.setUint32(28, 48000, true);
+        header.setUint16(32, 2, true);
+        header.setUint16(34, 16, true);
+        new Uint8Array(header.buffer, 36, 4).set(enc.encode("data"));
+        header.setUint32(40, bytes, true);
+        const out = new Uint8Array(44 + bytes);
+        out.set(new Uint8Array(header.buffer));
+        out.set(new Uint8Array(pcm.buffer, 0, bytes), 44);
+        return new Response(out, { headers: { "Content-Type": "audio/wav" } });
+      }
       return new Response("kitchen-companion relay: POST audio/wav to /talk", { status: 200 });
     }
-    const wav = await request.arrayBuffer();
-    const mode = request.headers.get("X-Mode") ?? "consult";
-    const newSession = request.headers.get("X-New-Session") === "1";
-    // 応答ストリームを即座に返し、フィラー音声→本編の順で書き込む。
-    // デバイスは届いた順に再生するだけなので、待ち時間中に「考え中」の声が出せる
-    const { readable, writable } = new TransformStream();
-    ctx.waitUntil(pipeline(env, wav, mode, newSession, writable));
-    return new Response(readable, {
-      headers: { "Content-Type": "application/octet-stream" },
-    });
+
+    // ※フィラー音声先行のストリーミング方式は、デバイス側を全受信再生に戻したため撤去した
+    //   (経緯は docs/decisions.md「フィラー音声先行方式」の項を参照)
+    const t0 = Date.now();
+    try {
+      const wav = await request.arrayBuffer();
+
+      // 1. STT
+      const fd = new FormData();
+      fd.append("file", new Blob([wav], { type: "audio/wav" }), "speech.wav");
+      fd.append("model", STT_MODEL);
+      fd.append("language", "ja");
+      const stt = await openai("audio/transcriptions", env, { method: "POST", body: fd });
+      const transcript = (await stt.json()).text ?? "";
+      const tStt = Date.now();
+
+      // キャラごとの声(X-Characterヘッダで選択)
+      const characterName = request.headers.get("X-Character") ?? "";
+      const voice = VOICE_BY_CHARACTER[characterName] ?? TTS_VOICE;
+
+      // 2. LLM(KVの会話履歴つき。「新規」指示があれば先に消す)
+      const HISTORY_KEY = "session";
+      const MAX_TURNS = 6;
+      const mode = request.headers.get("X-Mode") ?? "consult";
+      const systemPrompt = MODE_PROMPTS[mode] ?? MODE_PROMPTS.consult;
+      if (request.headers.get("X-New-Session") === "1") {
+        await env.HISTORY.delete(HISTORY_KEY);
+      }
+      const history = ((await env.HISTORY.get(HISTORY_KEY, "json")) ?? []).slice(-MAX_TURNS * 2);
+      const chat = await openai("chat/completions", env, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: LLM_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...history,
+            { role: "user", content: transcript },
+          ],
+          max_tokens: 250,
+        }),
+      });
+      const reply = (await chat.json()).choices[0].message.content.trim();
+      const tLlm = Date.now();
+
+      const newHistory = [
+        ...history,
+        { role: "user", content: transcript },
+        { role: "assistant", content: reply },
+      ].slice(-MAX_TURNS * 2);
+      await env.HISTORY.put(HISTORY_KEY, JSON.stringify(newHistory), { expirationTtl: 1800 });
+
+      // 3. TTS(一括) → 16kHzへリサンプル+末尾300ms無音(デバイスのDMA対策)
+      const tts = await openai("audio/speech", env, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: TTS_MODEL, voice, input: reply, response_format: "pcm" }),
+      });
+      const pcm16 = resample24kTo16k(new Int16Array(await tts.arrayBuffer()));
+      const out = new Int16Array(pcm16.length + 4800);
+      out.set(pcm16);
+      const tTts = Date.now();
+
+      return new Response(out.buffer, {
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Transcript": encodeURIComponent(transcript),
+          "X-Reply": encodeURIComponent(reply),
+          "X-Timing": `stt=${tStt - t0}ms llm=${tLlm - tStt}ms tts=${tTts - tLlm}ms total=${tTts - t0}ms voice=${voice}`,
+        },
+      });
+    } catch (e) {
+      return new Response(`relay error: ${e.message}`, { status: 502 });
+    }
   },
 };
-
-// 待ち時間に流すフィラー(初回にTTS生成してKVへキャッシュ)
-const FILLERS = [
-  "うーん、ちょっと考えるね。",
-  "はいはい、ちょっと待っててね。",
-];
-
-async function fillerAudio(env, idx) {
-  const key = `filler_v1_${idx}`;
-  const cached = await env.HISTORY.get(key, "arrayBuffer");
-  if (cached) return new Uint8Array(cached);
-  const tts = await openai("audio/speech", env, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: TTS_MODEL, voice: TTS_VOICE, input: FILLERS[idx], response_format: "pcm" }),
-  });
-  const pcm16 = resample24kTo16k(new Int16Array(await tts.arrayBuffer()));
-  const bytes = new Uint8Array(pcm16.buffer, 0, pcm16.byteLength);
-  await env.HISTORY.put(key, bytes.buffer); // フィラーは失効させない
-  return bytes;
-}
-
-async function pipeline(env, wav, mode, newSession, writable) {
-  const t0 = Date.now();
-  const writer = writable.getWriter();
-  try {
-    // 0. フィラーを先に流す(この裏でSTT以降が走る)
-    const filler = await fillerAudio(env, Math.floor(Math.random() * FILLERS.length));
-    await writer.write(filler);
-    // フィラーと本編の間に短い無音(0.4秒)を挟む
-    await writer.write(new Uint8Array(6400 * 2));
-
-    // 1. STT
-    const fd = new FormData();
-    fd.append("file", new Blob([wav], { type: "audio/wav" }), "speech.wav");
-    fd.append("model", STT_MODEL);
-    fd.append("language", "ja");
-    const stt = await openai("audio/transcriptions", env, { method: "POST", body: fd });
-    const transcript = (await stt.json()).text ?? "";
-    const tStt = Date.now();
-
-    // 2. LLM(KVの会話履歴つき。「新規」指示があれば先に消す)
-    const HISTORY_KEY = "session";
-    const MAX_TURNS = 6;
-    const systemPrompt = MODE_PROMPTS[mode] ?? MODE_PROMPTS.consult;
-    if (newSession) {
-      await env.HISTORY.delete(HISTORY_KEY);
-    }
-    const history = ((await env.HISTORY.get(HISTORY_KEY, "json")) ?? []).slice(-MAX_TURNS * 2);
-    const chat = await openai("chat/completions", env, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: LLM_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...history,
-          { role: "user", content: transcript },
-        ],
-        max_tokens: 250,
-      }),
-    });
-    const reply = (await chat.json()).choices[0].message.content.trim();
-    const tLlm = Date.now();
-
-    const newHistory = [
-      ...history,
-      { role: "user", content: transcript },
-      { role: "assistant", content: reply },
-    ].slice(-MAX_TURNS * 2);
-    await env.HISTORY.put(HISTORY_KEY, JSON.stringify(newHistory), { expirationTtl: 1800 });
-
-    // 3. TTS(一括。文分割ストリーミングは発音品質の問題で不採用) → 末尾無音つきで送出
-    const tts = await openai("audio/speech", env, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: TTS_MODEL, voice: TTS_VOICE, input: reply, response_format: "pcm" }),
-    });
-    const pcm16 = resample24kTo16k(new Int16Array(await tts.arrayBuffer()));
-    await writer.write(new Uint8Array(pcm16.buffer, 0, pcm16.byteLength));
-    await writer.write(new Uint8Array(4800 * 2)); // 末尾300ms無音(デバイスのDMA対策)
-    console.log(`talk ok: stt=${tStt - t0}ms llm=${tLlm - tStt}ms tts=${Date.now() - tLlm}ms 「${transcript}」`);
-  } catch (e) {
-    console.log(`pipeline error: ${e.message}`);
-  } finally {
-    await writer.close().catch(() => {});
-  }
-}

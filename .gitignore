@@ -9,3 +9,6 @@ recordings/
 # wranglerのローカルキャッシュ
 cloud/.wrangler/
 cloud/node_modules/
+
+# デバッグログ(SSID等を含むためコミットしない)
+/debug-logs/
